@@ -51,8 +51,8 @@ export const personaPresets: PersonaPreset[] = [
     ],
     voiceOutputLanguage: OutputLanguage.Japanese,
     textOutputLanguage: OutputLanguage.Chinese,
-    ttsVoiceId: 'speech:siliconflow-kurisu:clzv7bjjm041fufyct2z0setm:mphrsbbmvrjfophbsted',
-    referenceAudioAsset: 'voices/kurisu-reference.mp3',
+    ttsVoiceId: '',
+    referenceAudioAsset: 'voices/kurisu-reference.wav',
   },
 ];
 

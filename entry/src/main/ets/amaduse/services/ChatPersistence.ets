@@ -9,6 +9,7 @@ import {
   ConfiguredModel,
   ModelProviderPreset,
   ModelSettings,
+  VoiceBackend,
   VoiceSettings,
 } from '../model/AppModels';
 import {
@@ -21,7 +22,8 @@ import {
   currentTimeText,
 } from './AppUtils';
 
-export const DEFAULT_VOICE_REFERENCE_SOURCE: string = 'asset://voices/kurisu-reference.mp3';
+export const DEFAULT_VOICE_REFERENCE_SOURCE: string = 'asset://voices/kurisu-reference.wav';
+const LEGACY_VOICE_REFERENCE_SOURCE: string = 'asset://voices/kurisu-reference.mp3';
 
 const STORE_NAME = 'amaduse_store';
 const KEY_CONFIGURED_MODELS = 'configured_models';
@@ -78,11 +80,15 @@ interface ModelSettingsStorage {
 }
 
 interface VoiceSettingsStorage {
+  tts_backend?: string;
   siliconflow_api_key: string;
   reference_audio_source: string;
   cloned_voice_uri: string;
+  cloned_voice_reference_key?: string;
   auto_play: boolean;
   sync_text_output: boolean;
+  speed?: number;
+  gain?: number;
 }
 
 export class ChatPersistence {
@@ -184,11 +190,15 @@ export class ChatPersistence {
     try {
       const item = JSON.parse(raw) as VoiceSettingsStorage;
       return {
+        ttsBackend: voiceBackendValue(item.tts_backend, VoiceBackend.Cloud),
         siliconFlowApiKey: stringValue(item.siliconflow_api_key),
-        referenceAudioSource: stringValue(item.reference_audio_source, DEFAULT_VOICE_REFERENCE_SOURCE),
+        referenceAudioSource: voiceReferenceSourceValue(item.reference_audio_source),
         clonedVoiceUri: stringValue(item.cloned_voice_uri),
-        autoPlay: booleanValue(item.auto_play, false),
+        clonedVoiceReferenceKey: stringValue(item.cloned_voice_reference_key),
+        autoPlay: booleanValue(item.auto_play, true),
         syncTextOutput: booleanValue(item.sync_text_output, true),
+        speed: numberValue(item.speed, 1.0),
+        gain: numberValue(item.gain, 0),
       };
     } catch (_) {
       return defaultVoiceSettings();
@@ -197,11 +207,15 @@ export class ChatPersistence {
 
   static async saveVoiceSettings(context: common.UIAbilityContext, settings: VoiceSettings): Promise<void> {
     const payload: VoiceSettingsStorage = {
+      tts_backend: settings.ttsBackend,
       siliconflow_api_key: settings.siliconFlowApiKey,
       reference_audio_source: settings.referenceAudioSource.length > 0 ? settings.referenceAudioSource : DEFAULT_VOICE_REFERENCE_SOURCE,
       cloned_voice_uri: settings.clonedVoiceUri,
+      cloned_voice_reference_key: settings.clonedVoiceReferenceKey,
       auto_play: settings.autoPlay,
       sync_text_output: settings.syncTextOutput,
+      speed: settings.speed,
+      gain: settings.gain,
     };
     await ChatPersistence.putString(context, KEY_VOICE_SETTINGS, JSON.stringify(payload));
   }
@@ -292,11 +306,15 @@ export function defaultModelSettings(): ModelSettings {
 
 export function defaultVoiceSettings(): VoiceSettings {
   return {
+    ttsBackend: VoiceBackend.Cloud,
     siliconFlowApiKey: '',
     referenceAudioSource: DEFAULT_VOICE_REFERENCE_SOURCE,
     clonedVoiceUri: '',
-    autoPlay: false,
+    clonedVoiceReferenceKey: '',
+    autoPlay: true,
     syncTextOutput: true,
+    speed: 1.0,
+    gain: 0,
   };
 }
 
@@ -410,4 +428,29 @@ function stringValue(value: string | undefined, fallback: string = ''): string {
 
 function booleanValue(value: boolean | undefined, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
+}
+
+function numberValue(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function voiceBackendValue(value: string | undefined, fallback: VoiceBackend): VoiceBackend {
+  if (value === VoiceBackend.Off) {
+    return VoiceBackend.Off;
+  }
+  if (value === VoiceBackend.Local) {
+    return VoiceBackend.Local;
+  }
+  if (value === VoiceBackend.Cloud) {
+    return VoiceBackend.Cloud;
+  }
+  return fallback;
+}
+
+function voiceReferenceSourceValue(value: string | undefined): string {
+  const source = stringValue(value, DEFAULT_VOICE_REFERENCE_SOURCE);
+  if (source === LEGACY_VOICE_REFERENCE_SOURCE || source === 'voices/kurisu-reference.mp3') {
+    return DEFAULT_VOICE_REFERENCE_SOURCE;
+  }
+  return source;
 }

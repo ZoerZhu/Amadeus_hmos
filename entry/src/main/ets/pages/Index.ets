@@ -16,6 +16,7 @@ import {
   PersonaPreset,
   SettingsSheetMode,
   ToolShortcut,
+  VoiceBackend,
   VoiceSettings,
 } from '../amaduse/model/AppModels';
 import {
@@ -34,7 +35,10 @@ import {
   updateRecordPreview,
 } from '../amaduse/services/ChatPersistence';
 import { ChatService } from '../amaduse/services/ChatService';
-import { VoiceService } from '../amaduse/services/VoiceService';
+import {
+  VoicePlaybackCallbacks,
+  VoiceService,
+} from '../amaduse/services/VoiceService';
 import {
   createId,
   currentTimeText,
@@ -61,6 +65,9 @@ const TEXT_SCAN_STEPS = 84;
 const TEXT_SCAN_FRAME_MS = 50;
 const TEXT_SCAN_BACKGROUND_SCALE = 2.2;
 const PAGE_SLIDE_WIDTH = 420;
+const TRANSCRIPT_COLLAPSED_PERCENT = 36;
+const TRANSCRIPT_EXPANDED_PERCENT = 84;
+const TRANSCRIPT_DRAG_RANGE = 360;
 const START_RECORD: ChatRecord = createNewChatRecord();
 
 function sleep(milliseconds: number): Promise<void> {
@@ -352,6 +359,8 @@ struct Index {
   @State private attachments: ComposerAttachment[] = [];
   @State private toolsVisible: boolean = false;
   @State private characterExpanded: boolean = false;
+  @State private transcriptProgress: number = 0;
+  @State private transcriptDetachedFromBottom: boolean = false;
   @State private historyProgress: number = 0;
   @State private recording: boolean = false;
   @State private sending: boolean = false;
@@ -370,8 +379,11 @@ struct Index {
   @State private editApiKey: string = '';
   @State private editVoiceApiKey: string = '';
   @State private editVoiceUri: string = '';
-  @State private editVoiceAutoPlay: boolean = false;
+  @State private editVoiceEnabled: boolean = true;
+  @State private editVoiceAutoPlay: boolean = true;
   @State private editVoiceSync: boolean = true;
+  private transcriptDragStartProgress: number = 0;
+  private transcriptAutoScrolling: boolean = false;
   private pageDragStartProgress: number = 0;
 
   aboutToAppear(): void {
@@ -396,6 +408,7 @@ struct Index {
     this.messages = await ChatPersistence.loadChatMessages(context, selectedRecord.id);
     this.prepareSettingsDraft(SettingsSheetMode.Full);
     this.loading = false;
+    this.scrollTranscriptToBottom(true);
   }
 
   build() {
@@ -616,7 +629,7 @@ struct Index {
     Column() {
       Row() {
         Blank()
-          .width(this.characterExpanded ? 48 : 42)
+          .width(this.transcriptHandleWidth())
           .height(4)
           .borderRadius(2)
           .backgroundColor('#660B0B0C')
@@ -629,49 +642,103 @@ struct Index {
       })
       .gesture(
         PanGesture({ direction: PanDirection.Vertical, distance: 6 })
+          .onActionStart(() => {
+            this.beginTranscriptPan();
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.updateTranscriptPan(event);
+          })
           .onActionEnd((event: GestureEvent) => {
-            this.handleTranscriptPan(event);
+            this.finishTranscriptPan(event);
           })
       )
 
-      Scroll(this.transcriptScroller) {
-        Column() {
-          Text('今天')
-            .fontSize(12)
-            .fontColor('#747474')
-            .padding({ left: 12, right: 12, top: 4, bottom: 4 })
-            .borderRadius(12)
-            .backgroundColor('#AAFFFFFF')
-            .alignSelf(ItemAlign.Center)
-            .margin({ bottom: 8 })
+      Stack({ alignContent: Alignment.Bottom }) {
+        Scroll(this.transcriptScroller) {
+          Column() {
+            Text('今天')
+              .fontSize(12)
+              .fontColor('#747474')
+              .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+              .borderRadius(12)
+              .backgroundColor('#AAFFFFFF')
+              .alignSelf(ItemAlign.Center)
+              .margin({ bottom: 8 })
 
-          ForEach(this.messages, (message: ChatMessage, index: number) => {
-            this.messageRow(message, index);
-          }, (message: ChatMessage) => this.messageRenderKey(message))
+            ForEach(this.messages, (message: ChatMessage, index: number) => {
+              this.messageRow(message, index);
+            }, (message: ChatMessage) => this.messageRenderKey(message))
 
-          if (this.sending && !this.hasStreamingMessage()) {
-            this.typingPreview();
+            if (this.sending && !this.hasStreamingMessage()) {
+              this.typingPreview();
+            }
+
+            Blank().height(16)
           }
-
-          Blank().height(16)
+          .width('100%')
         }
         .width('100%')
+        .height('100%')
+        .scrollBar(BarState.Off)
+        .onDidScroll((_xOffset: number, _yOffset: number, _scrollState: ScrollState) => {
+          this.updateTranscriptBottomButton();
+        })
+        .onReachEnd(() => {
+          this.markTranscriptAtBottom();
+        })
+        .onScrollStop(() => {
+          this.updateTranscriptBottomButton();
+        })
+
+        if (this.transcriptDetachedFromBottom) {
+          Row() {
+            Blank()
+              .layoutWeight(1)
+            this.transcriptBottomButton();
+          }
+          .width('100%')
+          .padding({ right: 12, bottom: 12 })
+          .alignItems(VerticalAlign.Center)
+        }
       }
       .width('100%')
       .layoutWeight(1)
-      .scrollBar(BarState.Off)
     }
     .width('100%')
-    .height(this.characterExpanded ? '84%' : '36%')
+    .height(this.transcriptHeight())
     .padding({
-      left: this.characterExpanded ? 10 : 0,
-      right: this.characterExpanded ? 10 : 0,
-      top: this.characterExpanded ? 8 : 0,
+      left: this.transcriptHorizontalPadding(),
+      right: this.transcriptHorizontalPadding(),
+      top: this.transcriptTopPadding(),
       bottom: 78,
     })
-    .borderRadius(this.characterExpanded ? 28 : 22)
-    .backgroundColor(this.characterExpanded ? '#A8EFF3F2' : '#00FFFFFF')
-    .border({ width: this.characterExpanded ? 1 : 0, color: LINE })
+    .borderRadius(this.transcriptBorderRadius())
+    .backgroundColor(this.transcriptBackgroundColor())
+    .border({ width: this.transcriptBorderWidth(), color: LINE })
+  }
+
+  @Builder
+  private transcriptBottomButton() {
+    Text('↓')
+      .fontSize(20)
+      .fontWeight(FontWeight.Bold)
+      .fontColor(INK_BLACK)
+      .textAlign(TextAlign.Center)
+      .width(42)
+      .height(42)
+      .padding({ top: 8 })
+      .borderRadius(22)
+      .backgroundColor('#EFFFFFFF')
+      .border({ width: 1, color: LINE })
+      .shadow({
+        radius: 12,
+        color: '#22000000',
+        offsetX: 0,
+        offsetY: 4,
+      })
+      .onClick(() => {
+        this.returnTranscriptToBottom();
+      })
   }
 
   @Builder
@@ -1565,18 +1632,15 @@ struct Index {
         .margin({ bottom: 8 })
         .alignSelf(ItemAlign.Start)
       Column() {
-        Text('默认使用硅基流动 CosyVoice2，并以 rawfile 下的 Kurisu 音频作为动态参考音色。填写 Voice URI 后会优先使用固定音色；自动播报只播放最终回复，不播放思考过程。')
+        Text('默认使用硅基流动 CosyVoice2 和 rawfile/voices/kurisu-reference.wav 参考音频。朗读前会按人格语言翻译为日语，长文本按段生成，最多两个云端任务并行准备并按原顺序播放；思考过程不会进入语音输出。')
           .fontSize(12)
           .fontColor('#666666')
           .lineHeight(18)
         this.inputField('SiliconFlow API Key', this.editVoiceApiKey, (value: string) => this.editVoiceApiKey = value, 'sk-...', true);
         this.inputField('Voice URI', this.editVoiceUri, (value: string) => this.editVoiceUri = value, 'speech:...', false);
-        this.smallPill(this.editVoiceAutoPlay ? '自动播报：开' : '自动播报：关', this.editVoiceAutoPlay, () => {
-          this.editVoiceAutoPlay = !this.editVoiceAutoPlay;
-        });
-        this.smallPill(this.editVoiceSync ? '语音文本同步：开' : '语音文本同步：关', this.editVoiceSync, () => {
-          this.editVoiceSync = !this.editVoiceSync;
-        });
+        this.voiceSwitchRow('云端语音', '关闭后不再请求语音生成服务', 'enabled');
+        this.voiceSwitchRow('自动播报', '模型回复完成后自动播放语音', 'autoPlay');
+        this.voiceSwitchRow('语音字幕同步', '接收到对应语音后再流式显示字幕', 'sync');
       }
       .width('100%')
       .padding(10)
@@ -1684,6 +1748,59 @@ struct Index {
     }
     .width('100%')
     .margin({ top: 8 })
+  }
+
+  @Builder
+  private voiceSwitchRow(label: string, detail: string, kind: string) {
+    Button({ type: ButtonType.Normal, stateEffect: true }) {
+      Row() {
+        Column() {
+          Text(label)
+            .fontSize(14)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(INK_BLACK)
+          Text(detail)
+            .fontSize(11)
+            .fontColor('#777777')
+            .margin({ top: 3 })
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        Row() {
+          Blank()
+            .width(19)
+            .height(19)
+            .borderRadius(10)
+            .backgroundColor(INK_WHITE)
+            .shadow({
+              radius: 4,
+              color: '#26000000',
+              offsetX: 0,
+              offsetY: 1,
+            })
+        }
+        .width(42)
+        .height(24)
+        .padding(2)
+        .borderRadius(999)
+        .backgroundColor(this.voiceSwitchSelected(kind) ? INK_BLACK : '#2A000000')
+        .justifyContent(this.voiceSwitchSelected(kind) ? FlexAlign.End : FlexAlign.Start)
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: 12, right: 10 })
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .height(54)
+    .padding(0)
+    .margin({ top: 8 })
+    .borderRadius(16)
+    .backgroundColor(this.voiceSwitchSelected(kind) ? '#0D000000' : '#70EFEFED')
+    .onClick(() => this.toggleVoiceSwitch(kind, label))
   }
 
   @Builder
@@ -1870,6 +1987,7 @@ struct Index {
     this.editApiKey = currentConfigured?.apiKey ?? this.modelSettings.apiKey;
     this.editVoiceApiKey = this.voiceSettings.siliconFlowApiKey;
     this.editVoiceUri = this.voiceSettings.clonedVoiceUri;
+    this.editVoiceEnabled = this.voiceSettings.ttsBackend !== VoiceBackend.Off;
     this.editVoiceAutoPlay = this.voiceSettings.autoPlay;
     this.editVoiceSync = this.voiceSettings.syncTextOutput;
   }
@@ -1891,12 +2009,17 @@ struct Index {
       nextModels.unshift(savedModel);
     }
     const nextSettings = configuredModelToSettings(savedModel);
+    const editedVoiceUri = this.editVoiceUri.trim();
     const nextVoice: VoiceSettings = {
+      ttsBackend: this.editVoiceEnabled ? VoiceBackend.Cloud : VoiceBackend.Off,
       siliconFlowApiKey: this.editVoiceApiKey.trim(),
       referenceAudioSource: this.voiceSettings.referenceAudioSource,
-      clonedVoiceUri: this.editVoiceUri.trim(),
+      clonedVoiceUri: editedVoiceUri,
+      clonedVoiceReferenceKey: editedVoiceUri === this.voiceSettings.clonedVoiceUri ? this.voiceSettings.clonedVoiceReferenceKey : '',
       autoPlay: this.editVoiceAutoPlay,
       syncTextOutput: this.editVoiceSync,
+      speed: this.voiceSettings.speed,
+      gain: this.voiceSettings.gain,
     };
     this.configuredModels = nextModels;
     this.modelSettings = nextSettings;
@@ -1909,6 +2032,72 @@ struct Index {
     this.settingsVisible = false;
   }
 
+  private voiceSwitchSelected(kind: string): boolean {
+    if (kind === 'enabled') {
+      return this.editVoiceEnabled;
+    }
+    if (kind === 'autoPlay') {
+      return this.editVoiceAutoPlay;
+    }
+    return this.editVoiceSync;
+  }
+
+  private toggleVoiceSwitch(kind: string, label: string): void {
+    const next = !this.voiceSwitchSelected(kind);
+    console.info(`[Amaduse] voice switch tap label=${label} next=${next}`);
+    if (kind === 'enabled') {
+      this.setVoiceEnabled(next);
+      return;
+    }
+    if (kind === 'autoPlay') {
+      this.setVoiceAutoPlay(next);
+      return;
+    }
+    this.setVoiceSync(next);
+  }
+
+  private setVoiceEnabled(enabled: boolean): void {
+    this.applyVoiceSwitches(enabled, this.editVoiceAutoPlay, this.editVoiceSync);
+  }
+
+  private setVoiceAutoPlay(autoPlay: boolean): void {
+    this.applyVoiceSwitches(this.editVoiceEnabled, autoPlay, this.editVoiceSync);
+  }
+
+  private setVoiceSync(syncTextOutput: boolean): void {
+    this.applyVoiceSwitches(this.editVoiceEnabled, this.editVoiceAutoPlay, syncTextOutput);
+  }
+
+  private applyVoiceSwitches(enabled: boolean, autoPlay: boolean, syncTextOutput: boolean): void {
+    this.editVoiceEnabled = enabled;
+    this.editVoiceAutoPlay = autoPlay;
+    this.editVoiceSync = syncTextOutput;
+    const editedVoiceUri = this.editVoiceUri.trim();
+    const nextVoice: VoiceSettings = {
+      ttsBackend: enabled ? VoiceBackend.Cloud : VoiceBackend.Off,
+      siliconFlowApiKey: this.editVoiceApiKey.trim(),
+      referenceAudioSource: this.voiceSettings.referenceAudioSource,
+      clonedVoiceUri: editedVoiceUri,
+      clonedVoiceReferenceKey: editedVoiceUri === this.voiceSettings.clonedVoiceUri ? this.voiceSettings.clonedVoiceReferenceKey : '',
+      autoPlay,
+      syncTextOutput,
+      speed: this.voiceSettings.speed,
+      gain: this.voiceSettings.gain,
+    };
+    this.voiceSettings = nextVoice;
+    console.info(`[Amaduse] voice switches enabled=${enabled} autoPlay=${autoPlay} syncText=${syncTextOutput}`);
+    ChatPersistence.saveVoiceSettings(this.abilityContext(), nextVoice)
+      .then(async (): Promise<void> => {
+        if (nextVoice.ttsBackend === VoiceBackend.Off) {
+          await VoiceService.stopCurrentPlayer();
+        }
+      })
+      .catch((error: Error | Object | string): void => {
+        console.error(`[Amaduse] save voice switch failed: ${errorToString(error)}`);
+        this.showToast('语音开关保存失败');
+      });
+  }
+
   private canSend(): boolean {
     return !this.sending && (this.draft.trim().length > 0 || this.attachments.length > 0);
   }
@@ -1917,20 +2106,116 @@ struct Index {
     return this.messages.findIndex((message: ChatMessage) => message.streaming) >= 0;
   }
 
-  private setTranscriptExpanded(expanded: boolean): void {
-    if (this.characterExpanded === expanded) {
-      return;
-    }
-    this.characterExpanded = expanded;
-    this.scrollTranscriptToBottom();
+  private transcriptHeight(): string {
+    const height = TRANSCRIPT_COLLAPSED_PERCENT +
+      (TRANSCRIPT_EXPANDED_PERCENT - TRANSCRIPT_COLLAPSED_PERCENT) * this.transcriptProgress;
+    return `${height}%`;
   }
 
-  private handleTranscriptPan(event: GestureEvent): void {
-    if (event.offsetY < -28 || event.velocityY < -220) {
-      this.setTranscriptExpanded(true);
-    } else if (event.offsetY > 28 || event.velocityY > 220) {
-      this.setTranscriptExpanded(false);
+  private transcriptHandleWidth(): number {
+    return 42 + 6 * this.transcriptProgress;
+  }
+
+  private transcriptHorizontalPadding(): number {
+    return 10 * this.transcriptProgress;
+  }
+
+  private transcriptTopPadding(): number {
+    return 8 * this.transcriptProgress;
+  }
+
+  private transcriptBorderRadius(): number {
+    return 22 + 6 * this.transcriptProgress;
+  }
+
+  private transcriptBorderWidth(): number {
+    return this.transcriptProgress > 0.04 ? 1 : 0;
+  }
+
+  private transcriptBackgroundColor(): string {
+    if (this.transcriptProgress <= 0.02) {
+      return '#00FFFFFF';
     }
+    const alpha = Math.round(168 * this.transcriptProgress);
+    return `#${this.hexByte(alpha)}EFF3F2`;
+  }
+
+  private setTranscriptExpanded(expanded: boolean): void {
+    const targetProgress = expanded ? 1 : 0;
+    if (this.characterExpanded === expanded && Math.abs(this.transcriptProgress - targetProgress) < 0.01) {
+      return;
+    }
+    this.getUIContext().animateTo({
+      duration: 220,
+      curve: Curve.EaseOut,
+      onFinish: () => {
+        this.characterExpanded = expanded;
+        this.transcriptProgress = targetProgress;
+        this.scrollTranscriptToBottom(true);
+      },
+    }, () => {
+      this.characterExpanded = expanded;
+      this.transcriptProgress = targetProgress;
+    });
+  }
+
+  private beginTranscriptPan(): void {
+    this.transcriptDragStartProgress = this.transcriptProgress;
+  }
+
+  private updateTranscriptPan(event: GestureEvent): void {
+    const nextProgress = this.transcriptDragStartProgress - event.offsetY / TRANSCRIPT_DRAG_RANGE;
+    this.transcriptProgress = this.clampTranscriptProgress(nextProgress);
+    this.characterExpanded = this.transcriptProgress >= 0.5;
+  }
+
+  private finishTranscriptPan(event: GestureEvent): void {
+    const projectedProgress = this.transcriptDragStartProgress -
+      event.offsetY / TRANSCRIPT_DRAG_RANGE -
+      event.velocityY / 2600;
+    this.setTranscriptExpanded(this.clampTranscriptProgress(projectedProgress) >= 0.5);
+  }
+
+  private resetTranscriptPanel(): void {
+    this.characterExpanded = false;
+    this.transcriptProgress = 0;
+    this.transcriptDragStartProgress = 0;
+    this.transcriptDetachedFromBottom = false;
+  }
+
+  private clampTranscriptProgress(value: number): number {
+    return Math.max(0, Math.min(1, value));
+  }
+
+  private updateTranscriptBottomButton(): void {
+    if (this.transcriptAutoScrolling) {
+      return;
+    }
+    this.transcriptDetachedFromBottom = !this.isTranscriptAtBottom();
+  }
+
+  private markTranscriptAtBottom(): void {
+    this.transcriptDetachedFromBottom = false;
+  }
+
+  private isTranscriptAtBottom(): boolean {
+    try {
+      return this.transcriptScroller.isAtEnd();
+    } catch (_) {
+      return true;
+    }
+  }
+
+  private returnTranscriptToBottom(): void {
+    this.scrollTranscriptToBottom(true);
+  }
+
+  private hexByte(value: number): string {
+    const bounded = Math.max(0, Math.min(255, Math.round(value)));
+    const digits = '0123456789ABCDEF';
+    const high = Math.floor(bounded / 16);
+    const low = bounded - high * 16;
+    return `${digits.charAt(high)}${digits.charAt(low)}`;
   }
 
   private openHistoryScreen(): void {
@@ -2053,6 +2338,12 @@ struct Index {
     if (text.trim().length === 0) {
       return;
     }
+    if (this.voiceSettings.ttsBackend === VoiceBackend.Off) {
+      if (!silent) {
+        this.showToast('云端语音已关闭');
+      }
+      return;
+    }
     if (this.voiceBusy) {
       return;
     }
@@ -2067,6 +2358,8 @@ struct Index {
         stripEmotionTagsForDisplay(text),
         this.selectedPersona,
         this.voiceSettings,
+        this.modelSettings,
+        (updated: VoiceSettings): Promise<void> => this.persistVoiceSettingsFromService(updated),
       );
       if (!result.ok) {
         this.showToast(result.error);
@@ -2079,6 +2372,22 @@ struct Index {
     } finally {
       this.voiceBusy = false;
     }
+  }
+
+  private async persistVoiceSettingsFromService(settings: VoiceSettings): Promise<void> {
+    const next: VoiceSettings = {
+      ttsBackend: settings.ttsBackend,
+      siliconFlowApiKey: settings.siliconFlowApiKey,
+      referenceAudioSource: settings.referenceAudioSource,
+      clonedVoiceUri: settings.clonedVoiceUri,
+      clonedVoiceReferenceKey: settings.clonedVoiceReferenceKey,
+      autoPlay: settings.autoPlay,
+      syncTextOutput: settings.syncTextOutput,
+      speed: settings.speed,
+      gain: settings.gain,
+    };
+    this.voiceSettings = next;
+    await ChatPersistence.saveVoiceSettings(this.abilityContext(), next);
   }
 
   private showToast(message: string): void {
@@ -2155,16 +2464,17 @@ struct Index {
     this.attachments = [];
     this.recording = false;
     this.toolsVisible = false;
-    this.characterExpanded = false;
+    this.resetTranscriptPanel();
     this.sending = true;
     this.responseToken += 1;
     const token = this.responseToken;
     await this.saveChatRecordsSafely(nextRecords);
     await this.saveCurrentMessagesSafely();
-    this.scrollTranscriptToBottom();
+    this.scrollTranscriptToBottom(true);
 
     let receivedStreamDelta = false;
     let streamedRawText = '';
+    const syncVoiceText = this.shouldSyncVoiceText();
 
     try {
       const history = this.messages.slice(0, assistantIndex);
@@ -2187,7 +2497,9 @@ struct Index {
           }
           receivedStreamDelta = true;
           streamedRawText += delta;
-          this.updateAssistantTextFromRaw(assistantIndex, streamedRawText);
+          if (!syncVoiceText) {
+            this.updateAssistantTextFromRaw(assistantIndex, streamedRawText);
+          }
         },
       );
       if (token !== this.responseToken) {
@@ -2199,11 +2511,11 @@ struct Index {
           await this.showAssistantFailure(assistantIndex, reply.error);
           return;
         }
-        await this.finishStreamingAssistant(assistantIndex, rawText, token);
+        await this.finishStreamingAssistant(assistantIndex, rawText, token, syncVoiceText);
         return;
       }
       const rawText = reply.error.length > 0 ? `请求失败：${reply.error}` : reply.text;
-      await this.streamAssistantText(assistantIndex, rawText, reply.thinking, token);
+      await this.streamAssistantText(assistantIndex, rawText, reply.thinking, token, syncVoiceText);
     } catch (error) {
       if (token !== this.responseToken) {
         return;
@@ -2258,7 +2570,7 @@ struct Index {
     this.scrollTranscriptToBottom();
   }
 
-  private async finishStreamingAssistant(index: number, rawText: string, token: number): Promise<void> {
+  private async finishStreamingAssistant(index: number, rawText: string, token: number, syncVoiceText: boolean = false): Promise<void> {
     if (token !== this.responseToken) {
       return;
     }
@@ -2268,6 +2580,10 @@ struct Index {
     }
     const displayText = stripEmotionTagsForDisplay(rawText).trimStart();
     const finalText = displayText.trim().length > 0 ? displayText : '模型没有返回正文。';
+    if (syncVoiceText) {
+      await this.startSyncedVoiceCaptionOutput(index, finalText, token);
+      return;
+    }
     this.updateMessage(index, (message: ChatMessage): ChatMessage => {
       return {
         id: message.id,
@@ -2291,7 +2607,7 @@ struct Index {
     this.autoPlayAssistant(finalText);
   }
 
-  private async streamAssistantText(index: number, rawText: string, thinking: string, token: number): Promise<void> {
+  private async streamAssistantText(index: number, rawText: string, thinking: string, token: number, syncVoiceText: boolean = false): Promise<void> {
     const emotion = extractEmotion(rawText);
     if (emotion.length > 0) {
       this.playEmotion(emotion);
@@ -2316,6 +2632,10 @@ struct Index {
           mode: message.mode,
         };
       });
+    }
+    if (syncVoiceText) {
+      await this.startSyncedVoiceCaptionOutput(index, visibleText, token);
+      return;
     }
     const chunks = splitForStreaming(visibleText);
     for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
@@ -2365,8 +2685,149 @@ struct Index {
     this.autoPlayAssistant(visibleText);
   }
 
+  private shouldSyncVoiceText(): boolean {
+    return this.voiceSettings.autoPlay &&
+      this.voiceSettings.syncTextOutput &&
+      this.voiceSettings.ttsBackend !== VoiceBackend.Off &&
+      this.voiceSettings.siliconFlowApiKey.trim().length > 0 &&
+      !this.voiceBusy;
+  }
+
+  private async startSyncedVoiceCaptionOutput(index: number, finalText: string, token: number): Promise<void> {
+    if (token !== this.responseToken) {
+      return;
+    }
+    if (this.voiceBusy) {
+      this.setSyncedAssistantFinalText(index, finalText);
+      this.sending = false;
+      await this.saveCurrentMessagesSafely();
+      return;
+    }
+    this.updateMessage(index, (message: ChatMessage): ChatMessage => {
+      return {
+        id: message.id,
+        author: message.author,
+        text: '',
+        isAgent: message.isAgent,
+        time: message.time,
+        attachments: message.attachments,
+        toolPreview: message.toolPreview,
+        thinking: message.thinking,
+        showThinking: message.thinking.length > 0,
+        thinkingExpanded: false,
+        streaming: true,
+        activeToolName: '',
+        mode: message.mode,
+      };
+    });
+    this.scrollTranscriptToBottom();
+    this.voiceBusy = true;
+    try {
+      const callbacks: VoicePlaybackCallbacks = {
+        onSegmentPlaybackStart: async (segmentIndex: number, text: string, durationMs: number): Promise<void> => {
+          await this.streamSyncedCaptionSegment(index, text, durationMs, token);
+        },
+      };
+      const result = await VoiceService.speak(
+        this.abilityContext(),
+        finalText,
+        this.selectedPersona,
+        this.voiceSettings,
+        this.modelSettings,
+        (updated: VoiceSettings): Promise<void> => this.persistVoiceSettingsFromService(updated),
+        callbacks,
+      );
+      if (token !== this.responseToken) {
+        return;
+      }
+      if (!result.ok) {
+        this.showToast(result.error);
+      }
+    } catch (error) {
+      if (token === this.responseToken) {
+        console.error(`[Amaduse] synced voice failed: ${errorToString(error)}`);
+        this.showToast(`语音失败：${errorToString(error).substring(0, 48)}`);
+      }
+    } finally {
+      this.voiceBusy = false;
+      if (token === this.responseToken) {
+        this.setSyncedAssistantFinalText(index, finalText);
+        this.sending = false;
+        await this.saveCurrentMessagesSafely();
+      }
+    }
+  }
+
+  private async streamSyncedCaptionSegment(index: number, text: string, durationMs: number, token: number): Promise<void> {
+    const chunks = this.captionChunks(text);
+    if (chunks.length === 0) {
+      return;
+    }
+    const frameDelay = this.captionFrameDelayMs(text, durationMs, chunks.length);
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+      if (token !== this.responseToken) {
+        return;
+      }
+      const chunk = chunks[chunkIndex];
+      this.updateMessage(index, (message: ChatMessage): ChatMessage => {
+        return {
+          id: message.id,
+          author: message.author,
+          text: message.text + chunk,
+          isAgent: message.isAgent,
+          time: message.time,
+          attachments: message.attachments,
+          toolPreview: message.toolPreview,
+          thinking: message.thinking,
+          showThinking: message.showThinking,
+          thinkingExpanded: false,
+          streaming: true,
+          activeToolName: '',
+          mode: message.mode,
+        };
+      });
+      this.scrollTranscriptToBottom();
+      await sleep(frameDelay);
+    }
+  }
+
+  private setSyncedAssistantFinalText(index: number, finalText: string): void {
+    this.updateMessage(index, (message: ChatMessage): ChatMessage => {
+      return {
+        id: message.id,
+        author: message.author,
+        text: finalText,
+        isAgent: message.isAgent,
+        time: message.time,
+        attachments: message.attachments,
+        toolPreview: message.toolPreview,
+        thinking: message.thinking,
+        showThinking: message.thinking.length > 0,
+        thinkingExpanded: false,
+        streaming: false,
+        activeToolName: '',
+        mode: message.mode,
+      };
+    });
+    this.scrollTranscriptToBottom();
+  }
+
+  private captionChunks(text: string): string[] {
+    const chunks: string[] = [];
+    for (let index = 0; index < text.length; index += 1) {
+      chunks.push(text.charAt(index));
+    }
+    return chunks;
+  }
+
+  private captionFrameDelayMs(text: string, durationMs: number, chunkCount: number): number {
+    const estimated = Math.max(900, text.length * 180 + 500);
+    const baseDuration = durationMs > 500 ? durationMs : estimated;
+    return Math.min(260, Math.max(24, Math.floor((baseDuration * 0.92) / Math.max(1, chunkCount))));
+  }
+
   private autoPlayAssistant(text: string): void {
-    if (!this.voiceSettings.autoPlay || text.trim().length === 0) {
+    if (!this.voiceSettings.autoPlay || this.voiceSettings.ttsBackend === VoiceBackend.Off || text.trim().length === 0) {
       return;
     }
     this.playMessageText(text, true);
@@ -2512,7 +2973,7 @@ struct Index {
     });
     this.messages = await ChatPersistence.loadChatMessages(this.abilityContext(), record.id);
     this.closeHistoryScreen();
-    this.scrollTranscriptToBottom();
+    this.scrollTranscriptToBottom(true);
   }
 
   private async createNewChat(): Promise<void> {
@@ -2531,7 +2992,7 @@ struct Index {
     this.messages = [];
     this.draft = '';
     this.attachments = [];
-    this.characterExpanded = false;
+    this.resetTranscriptPanel();
     this.closeHistoryScreen();
     this.newChatConfirmVisible = false;
     await ChatPersistence.saveChatRecords(this.abilityContext(), nextRecords);
@@ -2559,12 +3020,21 @@ struct Index {
     }
   }
 
-  private scrollTranscriptToBottom(): void {
+  private scrollTranscriptToBottom(force: boolean = false): void {
+    if (this.transcriptDetachedFromBottom && !force) {
+      return;
+    }
+    this.transcriptAutoScrolling = true;
+    this.transcriptDetachedFromBottom = false;
     setTimeout(() => {
       try {
         this.transcriptScroller.scrollEdge(Edge.Bottom);
       } catch (_) {
       }
     }, 20);
+    setTimeout(() => {
+      this.transcriptAutoScrolling = false;
+      this.transcriptDetachedFromBottom = !this.isTranscriptAtBottom();
+    }, 260);
   }
 }

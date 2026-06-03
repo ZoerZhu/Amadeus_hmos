@@ -24,6 +24,12 @@ export enum OutputLanguage {
   English = 'English',
 }
 
+export enum VoiceBackend {
+  Off = 'off',
+  Cloud = 'cloud',
+  Local = 'local',
+}
+
 export interface OutputLanguageSpec {
   code: string;
   promptLabel: string;
@@ -114,11 +120,15 @@ export interface PersonaPreset {
 }
 
 export interface VoiceSettings {
+  ttsBackend: VoiceBackend;
   siliconFlowApiKey: string;
   referenceAudioSource: string;
   clonedVoiceUri: string;
+  clonedVoiceReferenceKey: string;
   autoPlay: boolean;
   syncTextOutput: boolean;
+  speed: number;
+  gain: number;
 }
 
 export interface ChatUiState {
