@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "Amaduse"
+    },
+    {
+      "name": "permission_system_tools_reason",
+      "value": "用于根据你的对话指令创建、查询、修改或删除系统闹钟、日历日程和联系人。"
     }
   ]
 }

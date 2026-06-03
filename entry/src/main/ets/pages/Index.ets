@@ -11,11 +11,13 @@ import {
   chatModeLabel,
   ComposerAttachment,
   ConfiguredModel,
+  HostAgentSettings,
   ModelProviderPreset,
   ModelSettings,
   PersonaPreset,
   SettingsSheetMode,
   ToolShortcut,
+  ToolPreview,
   VoiceBackend,
   VoiceSettings,
 } from '../amaduse/model/AppModels';
@@ -29,6 +31,7 @@ import {
   ChatPersistence,
   configuredModelToSettings,
   createNewChatRecord,
+  defaultHostAgentSettings,
   defaultModelSettings,
   defaultVoiceSettings,
   makeConfiguredModel,
@@ -39,6 +42,11 @@ import {
   VoicePlaybackCallbacks,
   VoiceService,
 } from '../amaduse/services/VoiceService';
+import {
+  AgentToolCall,
+  AgentToolResult,
+} from '../amaduse/tools/AgentTools';
+import { LocalToolService } from '../amaduse/tools/LocalToolService';
 import {
   createId,
   currentTimeText,
@@ -354,6 +362,7 @@ struct Index {
   @State private selectedMode: ChatMode = ChatMode.Fast;
   @State private modelSettings: ModelSettings = defaultModelSettings();
   @State private voiceSettings: VoiceSettings = defaultVoiceSettings();
+  @State private hostAgentSettings: HostAgentSettings = defaultHostAgentSettings();
   @State private messages: ChatMessage[] = [];
   @State private draft: string = '';
   @State private attachments: ComposerAttachment[] = [];
@@ -382,6 +391,10 @@ struct Index {
   @State private editVoiceEnabled: boolean = true;
   @State private editVoiceAutoPlay: boolean = true;
   @State private editVoiceSync: boolean = true;
+  @State private editHostAgentEnabled: boolean = false;
+  @State private editHostAgentBaseUrl: string = '';
+  @State private editHostAgentEndpointPath: string = '/api/agent/invoke';
+  @State private editHostAgentApiKey: string = '';
   private transcriptDragStartProgress: number = 0;
   private transcriptAutoScrolling: boolean = false;
   private pageDragStartProgress: number = 0;
@@ -405,6 +418,7 @@ struct Index {
     this.selectedMode = await ChatPersistence.loadChatMode(context);
     this.modelSettings = await ChatPersistence.loadModelSettings(context, configured);
     this.voiceSettings = await ChatPersistence.loadVoiceSettings(context);
+    this.hostAgentSettings = await ChatPersistence.loadHostAgentSettings(context);
     this.messages = await ChatPersistence.loadChatMessages(context, selectedRecord.id);
     this.prepareSettingsDraft(SettingsSheetMode.Full);
     this.loading = false;
@@ -757,6 +771,10 @@ struct Index {
               this.thinkingCard(message, index);
             }
 
+            if (message.toolPreview !== undefined) {
+              this.toolPreviewCard(message.toolPreview);
+            }
+
             if (message.activeToolName.length > 0) {
               Text(`正在调用 ${message.activeToolName} ...`)
                 .fontSize(14)
@@ -949,6 +967,38 @@ struct Index {
     .borderRadius(14)
     .backgroundColor('#4DFFFFFF')
     .border({ width: 1, color: '#0D000000' })
+  }
+
+  @Builder
+  private toolPreviewCard(preview: ToolPreview) {
+    Column() {
+      Row() {
+        this.statusDot(preview.risk === '执行中')
+        Text(preview.title)
+          .fontSize(12)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#424242')
+          .layoutWeight(1)
+        Text(preview.risk)
+          .fontSize(11)
+          .fontColor(preview.risk === '失败' ? DANGER : '#6C6C6C')
+      }
+      .alignItems(VerticalAlign.Center)
+
+      if (preview.detail.length > 0) {
+        Text(preview.detail)
+          .fontSize(12)
+          .fontColor('#666666')
+          .lineHeight(18)
+          .margin({ top: 5 })
+      }
+    }
+    .alignSelf(ItemAlign.Stretch)
+    .padding({ left: 9, right: 9, top: 7, bottom: 8 })
+    .margin({ bottom: 9 })
+    .borderRadius(12)
+    .backgroundColor('#66FFFFFF')
+    .border({ width: 1, color: '#12000000' })
   }
 
   @Builder
@@ -1675,6 +1725,28 @@ struct Index {
     .margin({ top: 14 })
 
     Column() {
+      Text('主机后端 Agent')
+        .fontSize(14)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#666666')
+        .margin({ bottom: 8 })
+        .alignSelf(ItemAlign.Start)
+      Column() {
+        this.hostAgentSwitchRow();
+        this.inputField('Backend URL', this.editHostAgentBaseUrl, (value: string) => this.editHostAgentBaseUrl = value, 'http://192.168.1.10:8000', false);
+        this.inputField('Endpoint Path', this.editHostAgentEndpointPath, (value: string) => this.editHostAgentEndpointPath = value, '/api/agent/invoke', false);
+        this.inputField('Backend Key', this.editHostAgentApiKey, (value: string) => this.editHostAgentApiKey = value, 'optional', true);
+      }
+      .width('100%')
+      .padding(10)
+      .borderRadius(20)
+      .backgroundColor(GLASS_LIGHT)
+      .border({ width: 1, color: LINE })
+    }
+    .width('100%')
+    .margin({ top: 14 })
+
+    Column() {
       Text('应用设置')
         .fontSize(14)
         .fontWeight(FontWeight.Bold)
@@ -1801,6 +1873,59 @@ struct Index {
     .borderRadius(16)
     .backgroundColor(this.voiceSwitchSelected(kind) ? '#0D000000' : '#70EFEFED')
     .onClick(() => this.toggleVoiceSwitch(kind, label))
+  }
+
+  @Builder
+  private hostAgentSwitchRow() {
+    Button({ type: ButtonType.Normal, stateEffect: true }) {
+      Row() {
+        Column() {
+          Text('启用主机后端')
+            .fontSize(14)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(INK_BLACK)
+          Text('允许模型把需要电脑能力的任务转发到后端')
+            .fontSize(11)
+            .fontColor('#777777')
+            .margin({ top: 3 })
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start)
+
+        Row() {
+          Blank()
+            .width(19)
+            .height(19)
+            .borderRadius(10)
+            .backgroundColor(INK_WHITE)
+            .shadow({
+              radius: 4,
+              color: '#26000000',
+              offsetX: 0,
+              offsetY: 1,
+            })
+        }
+        .width(42)
+        .height(24)
+        .padding(2)
+        .borderRadius(999)
+        .backgroundColor(this.editHostAgentEnabled ? INK_BLACK : '#2A000000')
+        .justifyContent(this.editHostAgentEnabled ? FlexAlign.End : FlexAlign.Start)
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: 12, right: 10 })
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .height(54)
+    .padding(0)
+    .margin({ top: 8 })
+    .borderRadius(16)
+    .backgroundColor(this.editHostAgentEnabled ? '#0D000000' : '#70EFEFED')
+    .onClick(() => this.editHostAgentEnabled = !this.editHostAgentEnabled)
   }
 
   @Builder
@@ -1990,6 +2115,10 @@ struct Index {
     this.editVoiceEnabled = this.voiceSettings.ttsBackend !== VoiceBackend.Off;
     this.editVoiceAutoPlay = this.voiceSettings.autoPlay;
     this.editVoiceSync = this.voiceSettings.syncTextOutput;
+    this.editHostAgentEnabled = this.hostAgentSettings.enabled;
+    this.editHostAgentBaseUrl = this.hostAgentSettings.baseUrl;
+    this.editHostAgentEndpointPath = this.hostAgentSettings.endpointPath;
+    this.editHostAgentApiKey = this.hostAgentSettings.apiKey;
   }
 
   private async saveSettings(): Promise<void> {
@@ -2021,13 +2150,21 @@ struct Index {
       speed: this.voiceSettings.speed,
       gain: this.voiceSettings.gain,
     };
+    const nextHostAgent: HostAgentSettings = {
+      enabled: this.editHostAgentEnabled,
+      baseUrl: this.editHostAgentBaseUrl.trim(),
+      endpointPath: this.editHostAgentEndpointPath.trim().length > 0 ? this.editHostAgentEndpointPath.trim() : '/api/agent/invoke',
+      apiKey: this.editHostAgentApiKey.trim(),
+    };
     this.configuredModels = nextModels;
     this.modelSettings = nextSettings;
     this.voiceSettings = nextVoice;
+    this.hostAgentSettings = nextHostAgent;
     const context = this.abilityContext();
     await ChatPersistence.saveConfiguredModels(context, nextModels);
     await ChatPersistence.saveModelSettings(context, nextSettings);
     await ChatPersistence.saveVoiceSettings(context, nextVoice);
+    await ChatPersistence.saveHostAgentSettings(context, nextHostAgent);
     await ChatPersistence.saveChatMode(context, this.selectedMode);
     this.settingsVisible = false;
   }
@@ -2501,6 +2638,23 @@ struct Index {
             this.updateAssistantTextFromRaw(assistantIndex, streamedRawText);
           }
         },
+        {
+          onToolCallStart: (call: AgentToolCall): void => {
+            if (token !== this.responseToken) {
+              return;
+            }
+            this.showToolCallStart(assistantIndex, call);
+          },
+          onToolCallFinish: (result: AgentToolResult): void => {
+            if (token !== this.responseToken) {
+              return;
+            }
+            this.showToolCallFinish(assistantIndex, result);
+          },
+          executeTool: async (call: AgentToolCall): Promise<AgentToolResult> => {
+            return LocalToolService.execute(this.abilityContext(), call);
+          },
+        },
       );
       if (token !== this.responseToken) {
         return;
@@ -2542,6 +2696,56 @@ struct Index {
         thinkingExpanded: message.text.length === 0,
         streaming: message.streaming,
         activeToolName: message.activeToolName,
+        mode: message.mode,
+      };
+    });
+    this.scrollTranscriptToBottom();
+  }
+
+  private showToolCallStart(index: number, call: AgentToolCall): void {
+    this.updateMessage(index, (message: ChatMessage): ChatMessage => {
+      return {
+        id: message.id,
+        author: message.author,
+        text: message.text,
+        isAgent: message.isAgent,
+        time: message.time,
+        attachments: message.attachments,
+        toolPreview: {
+          title: `调用 ${call.displayName}`,
+          detail: call.displayDetail,
+          risk: '执行中',
+        },
+        thinking: message.thinking,
+        showThinking: message.showThinking,
+        thinkingExpanded: message.thinkingExpanded,
+        streaming: true,
+        activeToolName: call.displayName,
+        mode: message.mode,
+      };
+    });
+    this.scrollTranscriptToBottom();
+  }
+
+  private showToolCallFinish(index: number, result: AgentToolResult): void {
+    this.updateMessage(index, (message: ChatMessage): ChatMessage => {
+      return {
+        id: message.id,
+        author: message.author,
+        text: message.text,
+        isAgent: message.isAgent,
+        time: message.time,
+        attachments: message.attachments,
+        toolPreview: {
+          title: result.ok ? `已调用 ${result.displayName}` : `调用失败 ${result.displayName}`,
+          detail: result.summary,
+          risk: result.ok ? '已完成' : '失败',
+        },
+        thinking: message.thinking,
+        showThinking: message.showThinking,
+        thinkingExpanded: message.thinkingExpanded,
+        streaming: message.streaming,
+        activeToolName: '',
         mode: message.mode,
       };
     });
@@ -2895,7 +3099,10 @@ struct Index {
     const streaming = message.streaming ? '1' : '0';
     const thinkingVisible = message.showThinking ? '1' : '0';
     const thinkingExpanded = message.thinkingExpanded ? '1' : '0';
-    return `${message.id}-${message.text.length}-${message.thinking.length}-${streaming}-${thinkingVisible}-${thinkingExpanded}-${message.activeToolName.length}`;
+    const toolPreviewLength = message.toolPreview !== undefined
+      ? message.toolPreview.title.length + message.toolPreview.detail.length + message.toolPreview.risk.length
+      : 0;
+    return `${message.id}-${message.text.length}-${message.thinking.length}-${streaming}-${thinkingVisible}-${thinkingExpanded}-${message.activeToolName.length}-${toolPreviewLength}`;
   }
 
   private toggleThinking(index: number): void {

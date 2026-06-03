@@ -131,6 +131,13 @@ export interface VoiceSettings {
   gain: number;
 }
 
+export interface HostAgentSettings {
+  enabled: boolean;
+  baseUrl: string;
+  endpointPath: string;
+  apiKey: string;
+}
+
 export interface ChatUiState {
   selectedPersona: PersonaPreset;
   selectedMode: ChatMode;

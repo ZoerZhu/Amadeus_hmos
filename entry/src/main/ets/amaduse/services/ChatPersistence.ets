@@ -7,8 +7,10 @@ import {
   ChatRecord,
   ComposerAttachment,
   ConfiguredModel,
+  HostAgentSettings,
   ModelProviderPreset,
   ModelSettings,
+  ToolPreview,
   VoiceBackend,
   VoiceSettings,
 } from '../model/AppModels';
@@ -30,6 +32,7 @@ const KEY_CONFIGURED_MODELS = 'configured_models';
 const KEY_SELECTED_MODEL = 'selected_model';
 const KEY_MODEL_SETTINGS = 'model_settings';
 const KEY_VOICE_SETTINGS = 'voice_settings';
+const KEY_HOST_AGENT_SETTINGS = 'host_agent_settings';
 const KEY_CHAT_MODE = 'chat_mode';
 const KEY_CHAT_RECORDS = 'chat_records';
 const KEY_MESSAGES_PREFIX = 'messages_';
@@ -49,6 +52,12 @@ interface AttachmentStorage {
   kind: string;
 }
 
+interface ToolPreviewStorage {
+  title: string;
+  detail: string;
+  risk: string;
+}
+
 interface MessageStorage {
   id: string;
   author: string;
@@ -56,6 +65,7 @@ interface MessageStorage {
   is_agent: boolean;
   time: string;
   attachments: AttachmentStorage[];
+  tool_preview?: ToolPreviewStorage;
   thinking: string;
   show_thinking: boolean;
   thinking_expanded: boolean;
@@ -89,6 +99,13 @@ interface VoiceSettingsStorage {
   sync_text_output: boolean;
   speed?: number;
   gain?: number;
+}
+
+interface HostAgentSettingsStorage {
+  enabled?: boolean;
+  base_url?: string;
+  endpoint_path?: string;
+  api_key?: string;
 }
 
 export class ChatPersistence {
@@ -220,6 +237,35 @@ export class ChatPersistence {
     await ChatPersistence.putString(context, KEY_VOICE_SETTINGS, JSON.stringify(payload));
   }
 
+  static async loadHostAgentSettings(context: common.UIAbilityContext): Promise<HostAgentSettings> {
+    const raw = await ChatPersistence.getString(context, KEY_HOST_AGENT_SETTINGS, '');
+    if (raw.length === 0) {
+      return defaultHostAgentSettings();
+    }
+    try {
+      const item = JSON.parse(raw) as HostAgentSettingsStorage;
+      const defaults = defaultHostAgentSettings();
+      return {
+        enabled: booleanValue(item.enabled, defaults.enabled),
+        baseUrl: stringValue(item.base_url, defaults.baseUrl),
+        endpointPath: stringValue(item.endpoint_path, defaults.endpointPath),
+        apiKey: stringValue(item.api_key),
+      };
+    } catch (_) {
+      return defaultHostAgentSettings();
+    }
+  }
+
+  static async saveHostAgentSettings(context: common.UIAbilityContext, settings: HostAgentSettings): Promise<void> {
+    const payload: HostAgentSettingsStorage = {
+      enabled: settings.enabled,
+      base_url: settings.baseUrl,
+      endpoint_path: settings.endpointPath,
+      api_key: settings.apiKey,
+    };
+    await ChatPersistence.putString(context, KEY_HOST_AGENT_SETTINGS, JSON.stringify(payload));
+  }
+
   static async loadChatMode(context: common.UIAbilityContext): Promise<ChatMode> {
     const value = await ChatPersistence.getString(context, KEY_CHAT_MODE, ChatMode.Fast);
     return value === ChatMode.Thinking ? ChatMode.Thinking : ChatMode.Fast;
@@ -318,6 +364,15 @@ export function defaultVoiceSettings(): VoiceSettings {
   };
 }
 
+export function defaultHostAgentSettings(): HostAgentSettings {
+  return {
+    enabled: false,
+    baseUrl: '',
+    endpointPath: '/api/agent/invoke',
+    apiKey: '',
+  };
+}
+
 export function configuredModelToSettings(item: ConfiguredModel): ModelSettings {
   return {
     configuredModelId: item.id,
@@ -387,6 +442,7 @@ function messageToJson(message: ChatMessage): MessageStorage {
     is_agent: message.isAgent,
     time: message.time,
     attachments,
+    tool_preview: message.toolPreview === undefined ? undefined : toolPreviewToJson(message.toolPreview),
     thinking: message.thinking,
     show_thinking: message.showThinking,
     thinking_expanded: message.thinkingExpanded,
@@ -413,12 +469,38 @@ function jsonToMessage(item: MessageStorage): ChatMessage {
     isAgent: booleanValue(item.is_agent, true),
     time: stringValue(item.time, currentTimeText()),
     attachments,
+    toolPreview: jsonToToolPreview(item.tool_preview),
     thinking: cleanDisplayText(stringValue(item.thinking)),
     showThinking: booleanValue(item.show_thinking, false),
     thinkingExpanded: booleanValue(item.thinking_expanded, false),
     streaming: false,
     activeToolName: '',
     mode: stringValue(item.mode) === ChatMode.Thinking ? ChatMode.Thinking : ChatMode.Fast,
+  };
+}
+
+function toolPreviewToJson(preview: ToolPreview): ToolPreviewStorage {
+  return {
+    title: preview.title,
+    detail: preview.detail,
+    risk: preview.risk,
+  };
+}
+
+function jsonToToolPreview(item: ToolPreviewStorage | undefined): ToolPreview | undefined {
+  if (item === undefined) {
+    return undefined;
+  }
+  const title = stringValue(item.title);
+  const detail = stringValue(item.detail);
+  const risk = stringValue(item.risk);
+  if (title.length === 0 && detail.length === 0) {
+    return undefined;
+  }
+  return {
+    title,
+    detail,
+    risk,
   };
 }
 

@@ -15,6 +15,16 @@ import {
   cleanStreamChunk,
   currentPromptTimeText,
 } from './AppUtils';
+import {
+  AgentToolCall,
+  AgentToolCallbacks,
+  AgentToolDefinition,
+  AgentToolResult,
+  createAgentToolCall,
+  createAgentToolDefinitions,
+  createFallbackAgentToolCall,
+  isSupportedAgentTool,
+} from '../tools/AgentTools';
 
 export interface AssistantReply {
   text: string;
@@ -30,11 +40,6 @@ interface ChatCompletionModeConfig {
   defaultModel: string;
 }
 
-interface ChatCompletionMessage {
-  role: string;
-  content: string;
-}
-
 interface ThinkingPayload {
   type: string;
 }
@@ -48,6 +53,8 @@ interface ChatPayload {
   model: string;
   stream: boolean;
   messages: ChatCompletionMessage[];
+  tools?: AgentToolDefinition[];
+  tool_choice?: string;
   thinking?: ThinkingPayload;
   top_p?: number;
   temperature?: number;
@@ -65,10 +72,30 @@ interface HttpHeaderMap {
   'Authorization'?: string;
 }
 
+interface ChatCompletionToolFunction {
+  name?: string;
+  arguments?: string;
+}
+
+interface ChatCompletionToolCall {
+  id?: string;
+  type?: string;
+  function?: ChatCompletionToolFunction;
+}
+
+interface ChatCompletionMessage {
+  role: string;
+  content: string;
+  tool_calls?: ChatCompletionToolCall[];
+  tool_call_id?: string;
+  name?: string;
+}
+
 interface ChatCompletionResponseMessage {
   content?: string;
   reasoning_content?: string;
   reasoning?: string;
+  tool_calls?: ChatCompletionToolCall[];
 }
 
 interface ChatCompletionChoice {
@@ -97,6 +124,19 @@ interface StreamDelta {
   text: string;
   thinking: string;
   error: string;
+}
+
+interface HttpTextResponse {
+  code: number;
+  body: string;
+}
+
+interface ToolDecision {
+  text: string;
+  thinking: string;
+  error: string;
+  message: ChatCompletionResponseMessage;
+  toolCalls: AgentToolCall[];
 }
 
 export class ChatService {
@@ -178,13 +218,14 @@ export class ChatService {
     settings: ModelSettings,
     onThinkingDelta: (delta: string) => void,
     onTextDelta: (delta: string) => void,
+    toolCallbacks?: AgentToolCallbacks,
   ): Promise<AssistantReply> {
-    if (looksLikeLocalToolRequest(userText) && (!settings.useRemote || settings.apiKey.length === 0)) {
-      return {
-        text: '[emotion:neutral]\n我识别到这是一个工具请求。鸿蒙迁移版已经保留了工具入口和参数收集逻辑，但系统闹钟、日历、文件创建、语音播报这些平台级执行还需要继续接入 HarmonyOS 对应 API。先把目标、时间和内容说完整，我会按同样的流程整理参数。',
-        thinking: '',
-        error: '',
-      };
+    if (toolCallbacks !== undefined && looksLikeAgentToolRequest(userText) &&
+      (!settings.useRemote || (settings.apiKey.length === 0 && settings.provider.name.toLowerCase() !== 'ollama'))) {
+      const fallback = createFallbackAgentToolCall(userText);
+      if (fallback !== undefined) {
+        return ChatService.runFallbackToolCall(fallback, mode, toolCallbacks);
+      }
     }
 
     if (!settings.useRemote) {
@@ -207,8 +248,105 @@ export class ChatService {
 
     const base = trimEnd(settings.baseUrl.trim(), '/');
     const endpoint = `${base}/chat/completions`;
+    const toolReply = await ChatService.tryRunAgentToolRound(
+      endpoint,
+      history,
+      userText,
+      persona,
+      mode,
+      settings,
+      onThinkingDelta,
+      onTextDelta,
+      toolCallbacks,
+    );
+    if (toolReply !== undefined) {
+      return toolReply;
+    }
+
     const payload = ChatService.buildPayload(settings, persona, mode, history);
     payload.stream = true;
+    return ChatService.streamPayload(endpoint, payload, settings, mode, onThinkingDelta, onTextDelta);
+  }
+
+  private static async runFallbackToolCall(
+    call: AgentToolCall,
+    mode: ChatMode,
+    toolCallbacks: AgentToolCallbacks,
+  ): Promise<AssistantReply> {
+    toolCallbacks.onToolCallStart(call);
+    const result = await toolCallbacks.executeTool(call);
+    toolCallbacks.onToolCallFinish(result);
+    return {
+      text: `[emotion:neutral]\n${result.summary}`,
+      thinking: mode === ChatMode.Thinking ? '本地工具兜底：当前没有可用远程模型，因此用前端关键词规则生成了一次工具调用。' : '',
+      error: '',
+    };
+  }
+
+  private static async tryRunAgentToolRound(
+    endpoint: string,
+    history: ChatMessage[],
+    userText: string,
+    persona: PersonaPreset,
+    mode: ChatMode,
+    settings: ModelSettings,
+    onThinkingDelta: (delta: string) => void,
+    onTextDelta: (delta: string) => void,
+    toolCallbacks?: AgentToolCallbacks,
+  ): Promise<AssistantReply | undefined> {
+    if (toolCallbacks === undefined || !looksLikeAgentToolRequest(userText)) {
+      return undefined;
+    }
+
+    const payload = ChatService.buildPayload(settings, persona, mode, history);
+    payload.stream = false;
+    payload.tools = createAgentToolDefinitions();
+    payload.tool_choice = 'auto';
+    payload.messages.splice(1, 0, createChatCompletionMessage(
+      'system',
+      '你可以调用工具完成明确的外部动作：系统闹钟、系统日历、系统联系人，以及 host_agent_tool。host_agent_tool 会把任务转发给用户配置的主机后端工具或后端 Agent，适合电脑文件、命令、脚本、搜索、浏览器、MCP、LangGraph 或其他前端无法直接完成的能力。只有用户确实需要这些外部能力时才调用工具；普通聊天、解释、推理不要调用。缺少关键字段时先追问。endpoint_path 通常留空，payload_json 必须是 JSON object 字符串。工具返回后，根据结果生成简短自然语言回复。',
+    ));
+
+    const decisionResponse = await ChatService.requestCompletionPayload(endpoint, payload, settings);
+    if (decisionResponse.code < 200 || decisionResponse.code > 299) {
+      return { text: '', thinking: '', error: `HTTP ${decisionResponse.code} ${decisionResponse.body.substring(0, 220)}` };
+    }
+    const decision = ChatService.parseToolDecisionResponse(decisionResponse.body, mode);
+    if (decision.error.length > 0) {
+      return { text: '', thinking: decision.thinking, error: decision.error };
+    }
+    if (decision.toolCalls.length === 0) {
+      return {
+        text: decision.text.length > 0 ? decision.text : '[emotion:neutral]\n模型没有返回正文。',
+        thinking: decision.thinking,
+        error: '',
+      };
+    }
+
+    const toolMessages = payload.messages.slice();
+    toolMessages.push(createAssistantToolChatMessage(decision.message));
+    for (let index = 0; index < decision.toolCalls.length; index += 1) {
+      const call = decision.toolCalls[index];
+      toolCallbacks.onToolCallStart(call);
+      const result = await toolCallbacks.executeTool(call);
+      toolCallbacks.onToolCallFinish(result);
+      toolMessages.push(createToolResultChatMessage(result));
+    }
+
+    const finalPayload = ChatService.buildPayload(settings, persona, mode, []);
+    finalPayload.messages = toolMessages;
+    finalPayload.stream = true;
+    return ChatService.streamPayload(endpoint, finalPayload, settings, mode, onThinkingDelta, onTextDelta);
+  }
+
+  private static async streamPayload(
+    endpoint: string,
+    payload: ChatPayload,
+    settings: ModelSettings,
+    mode: ChatMode,
+    onThinkingDelta: (delta: string) => void,
+    onTextDelta: (delta: string) => void,
+  ): Promise<AssistantReply> {
     const request = http.createHttp();
     let responseText = '';
     let responseThinking = '';
@@ -248,13 +386,7 @@ export class ChatService {
 
     request.on('dataReceive', onDataReceive);
     try {
-      const headers: HttpHeaderMap = {
-        'Content-Type': 'application/json',
-        'Accept': 'text/event-stream',
-      };
-      if (settings.apiKey.length > 0) {
-        headers.Authorization = `Bearer ${settings.apiKey}`;
-      }
+      const headers = createHttpHeaders(settings, 'text/event-stream');
       const code = await request.requestInStream(endpoint, {
         method: http.RequestMethod.POST,
         header: headers,
@@ -297,6 +429,59 @@ export class ChatService {
     } finally {
       request.off('dataReceive', onDataReceive);
       request.destroy();
+    }
+  }
+
+  private static async requestCompletionPayload(
+    endpoint: string,
+    payload: ChatPayload,
+    settings: ModelSettings,
+  ): Promise<HttpTextResponse> {
+    const request = http.createHttp();
+    try {
+      const response = await request.request(endpoint, {
+        method: http.RequestMethod.POST,
+        header: createHttpHeaders(settings, 'application/json'),
+        extraData: JSON.stringify(payload),
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: 20000,
+        readTimeout: 60000,
+      });
+      return {
+        code: response.responseCode,
+        body: responseBodyToString(response.result, response.resultType),
+      };
+    } catch (error) {
+      return {
+        code: 0,
+        body: errorToString(error),
+      };
+    } finally {
+      request.destroy();
+    }
+  }
+
+  private static parseToolDecisionResponse(body: string, mode: ChatMode): ToolDecision {
+    try {
+      const json = JSON.parse(body) as ChatCompletionResponse;
+      const choices = json.choices;
+      if (!Array.isArray(choices) || choices.length === 0) {
+        return createToolDecision('', '', '响应中没有 choices。', {}, []);
+      }
+      const first = choices[0];
+      const message = first.message;
+      const text = cleanDisplayText(cleanStreamChunk(stringValue(message.content)));
+      let reasoning = '';
+      if (mode === ChatMode.Thinking) {
+        reasoning = cleanDisplayText(cleanStreamChunk(stringValue(message.reasoning_content)));
+        if (reasoning.length === 0) {
+          reasoning = cleanDisplayText(cleanStreamChunk(stringValue(message.reasoning)));
+        }
+      }
+      const toolCalls = parseAgentToolCalls(message);
+      return createToolDecision(text, reasoning, '', message, toolCalls);
+    } catch (error) {
+      return createToolDecision('', '', error instanceof Error ? error.message : '响应解析失败。', {}, []);
     }
   }
 
@@ -379,6 +564,77 @@ export class ChatService {
       };
     }
   }
+}
+
+function createHttpHeaders(settings: ModelSettings, accept: string): HttpHeaderMap {
+  const headers: HttpHeaderMap = {
+    'Content-Type': 'application/json',
+    'Accept': accept,
+  };
+  if (settings.apiKey.length > 0) {
+    headers.Authorization = `Bearer ${settings.apiKey}`;
+  }
+  return headers;
+}
+
+function createToolDecision(
+  text: string,
+  thinking: string,
+  error: string,
+  message: ChatCompletionResponseMessage,
+  toolCalls: AgentToolCall[],
+): ToolDecision {
+  return {
+    text,
+    thinking,
+    error,
+    message,
+    toolCalls,
+  };
+}
+
+function parseAgentToolCalls(message: ChatCompletionResponseMessage): AgentToolCall[] {
+  const rawToolCalls = message.tool_calls;
+  if (!Array.isArray(rawToolCalls) || rawToolCalls.length === 0) {
+    return [];
+  }
+  const calls: AgentToolCall[] = [];
+  rawToolCalls.forEach((toolCall: ChatCompletionToolCall) => {
+    const fn = toolCall.function;
+    if (fn === undefined) {
+      return;
+    }
+    const name = stringValue(fn.name);
+    if (!isSupportedAgentTool(name)) {
+      return;
+    }
+    calls.push(createAgentToolCall(stringValue(toolCall.id), name, stringValue(fn.arguments)));
+  });
+  return calls;
+}
+
+function createAssistantToolChatMessage(message: ChatCompletionResponseMessage): ChatCompletionMessage {
+  const rawToolCalls = message.tool_calls;
+  if (Array.isArray(rawToolCalls)) {
+    return {
+      role: 'assistant',
+      content: stringValue(message.content),
+      tool_calls: rawToolCalls,
+    };
+  }
+  return {
+    role: 'assistant',
+    content: stringValue(message.content),
+  };
+}
+
+function createToolResultChatMessage(result: AgentToolResult): ChatCompletionMessage {
+  return {
+    role: 'tool',
+    content: result.content,
+    tool_call_id: result.toolCallId,
+    name: result.toolName,
+  };
 }
 
 function parseStreamDelta(data: string, mode: ChatMode): StreamDelta {
@@ -552,6 +808,21 @@ function isOpenAiReasoningModel(model: string): boolean {
     normalized.startsWith('o3') ||
     normalized.startsWith('o4') ||
     normalized.startsWith('gpt-5');
+}
+
+function looksLikeAgentToolRequest(text: string): boolean {
+  const normalized = text.toLowerCase();
+  const words = [
+    '闹钟', '提醒我', '叫醒我', '日程', '日历', '会议', '行程', '安排',
+    '联系人', '通讯录', '电话', '手机号', '邮箱', '查一下联系人', '查联系人',
+    '主机', '后端', '电脑', 'pc', 'agent', 'mcp', 'langgraph', '调用工具',
+    '工具调用', '有什么工具', '哪些工具', '能力列表', '终端', '命令', '脚本',
+    '运行代码', '执行代码', '创建文件', '保存文件', '生成文件', '写入文件',
+    '搜索', '联网', '网上', '网页', '浏览器', '爬取', '下载',
+    'alarm', 'calendar', 'schedule', 'contact',
+    'tool', 'backend', 'host', 'computer', 'command', 'script', 'search', 'web',
+  ];
+  return words.some((word: string): boolean => normalized.indexOf(word) >= 0);
 }
 
 function looksLikeLocalToolRequest(text: string): boolean {
