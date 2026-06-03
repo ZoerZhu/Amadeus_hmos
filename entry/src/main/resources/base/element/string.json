@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Amaduse HarmonyOS entry module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Amaduse"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Amaduse"
+    }
+  ]
+}

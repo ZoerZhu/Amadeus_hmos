@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #f0f5f6;
+      touch-action: none;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+    }
+
+    #stage-bg {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      background: #f0f5f6;
+    }
+
+    #live2d {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      opacity: 0;
+      transition: opacity 180ms ease-out;
+    }
+
+    #live2d.is-visible {
+      opacity: 1;
+    }
+
+    #loading {
+      position: fixed;
+      left: 18px;
+      bottom: 22px;
+      z-index: 4;
+      padding: 9px 12px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.9);
+      color: rgba(11, 11, 12, 0.75);
+      font: 13px/1.45 system-ui, sans-serif;
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.08);
+    }
+
+    #fallback {
+      position: fixed;
+      left: 18px;
+      right: 18px;
+      bottom: 22px;
+      padding: 10px 12px;
+      border-radius: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      background: rgba(20, 20, 22, 0.58);
+      color: rgba(255, 255, 255, 0.88);
+      font: 13px/1.45 system-ui, sans-serif;
+      display: none;
+      z-index: 3;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage-bg"></div>
+  <div id="loading">Live2D loading...</div>
+  <div id="fallback"></div>
+
+  <script src="utils/live2d/pixi.min.js"></script>
+  <script src="utils/live2d/live2dcubismcore.min.js"></script>
+  <script src="utils/live2d/live2d.min.js"></script>
+  <script src="utils/live2d/index.min.js"></script>
+  <script>
+    const MODEL_URL = "live2dmodels/steinsGateKurisuNew/kurisu.model3.json";
+    const RANDOM_MOTIONS = ["neutral", "random1", "random2", "random3", "random4", "random5"];
+
+    const fallback = document.getElementById("fallback");
+    const loading = document.getElementById("loading");
+
+    function report(message) {
+      console.log("[AmaduseLive2D] " + message);
+    }
+
+    function showFallback(message) {
+      loading.style.display = "none";
+      fallback.textContent = message;
+      fallback.style.display = "block";
+      console.error("[AmaduseLive2D] " + message);
+    }
+
+    function hideLoading() {
+      loading.style.display = "none";
+    }
+
+    function notifyCanvasReady() {
+      if (window.__amaduseCanvasReady) {
+        return;
+      }
+      window.__amaduseCanvasReady = true;
+      try {
+        if (window.AmaduseAndroid && window.AmaduseAndroid.onCanvasReady) {
+          window.AmaduseAndroid.onCanvasReady();
+        }
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    function notifyCanvasPending() {
+      try {
+        if (window.AmaduseAndroid && window.AmaduseAndroid.onCanvasPending) {
+          window.AmaduseAndroid.onCanvasPending();
+        }
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    function notifyCanvasError(message) {
+      try {
+        if (window.AmaduseAndroid && window.AmaduseAndroid.onCanvasError) {
+          window.AmaduseAndroid.onCanvasError(message);
+        }
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    function nextFrame() {
+      return new Promise((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+    }
+
+    function frameHasVisiblePixels(app) {
+      const renderer = app && app.renderer;
+      const gl = renderer && renderer.gl;
+      if (!gl || renderer.width <= 0 || renderer.height <= 0) {
+        return false;
+      }
+
+      const sample = new Uint8Array(4);
+      const width = renderer.width;
+      const height = renderer.height;
+      let visibleSamples = 0;
+      for (let row = 2; row <= 8; row += 1) {
+        for (let column = 2; column <= 8; column += 1) {
+          const x = Math.max(0, Math.min(width - 1, Math.floor(width * column / 10)));
+          const y = Math.max(0, Math.min(height - 1, Math.floor(height * row / 10)));
+          gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, sample);
+          const color = sample[0] + sample[1] + sample[2];
+          if (sample[3] > 8 && color > 48) {
+            visibleSamples += 1;
+          }
+          if (visibleSamples >= 3) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    async function revealWhenFrameReady(app) {
+      for (let attempt = 0; attempt < 42; attempt += 1) {
+        app.render();
+        await nextFrame();
+        if (frameHasVisiblePixels(app)) {
+          app.view.classList.add("is-visible");
+          hideLoading();
+          notifyCanvasReady();
+          return;
+        }
+      }
+      report("pixel check timed out; reveal canvas after model load");
+      app.view.classList.add("is-visible");
+      hideLoading();
+      notifyCanvasReady();
+    }
+
+    function fitModel(app, model) {
+      const screenWidth = app.renderer.width;
+      const screenHeight = app.renderer.height;
+      const sourceWidth = Math.max(model.width / Math.max(model.scale.x, 0.0001), 1);
+      const sourceHeight = Math.max(model.height / Math.max(model.scale.y, 0.0001), 1);
+      const scale = Math.min(screenWidth / sourceWidth * 0.9, screenHeight / sourceHeight * 0.95);
+
+      if (model.anchor) {
+        model.anchor.set(0.5, 0.5);
+        model.position.set(screenWidth * 0.5, screenHeight * 0.52);
+      } else {
+        const bounds = model.getLocalBounds();
+        model.pivot.set(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        model.position.set(screenWidth * 0.5, screenHeight * 0.52);
+      }
+      model.scale.set(scale);
+      report("fit width=" + model.width.toFixed(1) + " height=" + model.height.toFixed(1) + " scale=" + scale.toFixed(4));
+    }
+
+    async function boot() {
+      notifyCanvasPending();
+      report("boot");
+      if (!window.PIXI || !PIXI.live2d || !PIXI.live2d.Live2DModel) {
+        showFallback("Live2D runtime was not loaded.");
+        notifyCanvasError("Live2D runtime was not loaded.");
+        return;
+      }
+
+      PIXI.live2d.config.sound = false;
+      PIXI.live2d.config.logLevel = PIXI.live2d.config.LOG_LEVEL_ERROR;
+
+      const app = new PIXI.Application({
+        backgroundAlpha: 0,
+        backgroundColor: 0xf0f5f6,
+        antialias: true,
+        autoStart: true,
+        preserveDrawingBuffer: true,
+        transparent: true,
+        width: window.innerWidth,
+        height: window.innerHeight
+      });
+
+      app.view.id = "live2d";
+      document.body.appendChild(app.view);
+      report("renderer ready " + app.renderer.width + "x" + app.renderer.height + " type=" + app.renderer.type);
+
+      const model = await PIXI.live2d.Live2DModel.from(MODEL_URL, {
+        autoInteract: true,
+        motionPreload: PIXI.live2d.MotionPreloadStrategy.NONE
+      });
+      report("model loaded");
+
+      app.stage.addChild(model);
+      fitModel(app, model);
+      await revealWhenFrameReady(app);
+
+      let stableWidth = app.renderer.width;
+      let stableHeight = app.renderer.height;
+      window.addEventListener("resize", () => {
+        const nextWidth = window.innerWidth;
+        const nextHeight = window.innerHeight;
+        const likelyImeResize = Math.abs(nextWidth - stableWidth) < 4 && nextHeight < stableHeight * 0.78;
+        if (likelyImeResize) {
+          report("ignore ime resize " + nextWidth + "x" + nextHeight);
+          return;
+        }
+
+        stableWidth = nextWidth;
+        stableHeight = nextHeight;
+        app.renderer.resize(stableWidth, stableHeight);
+        fitModel(app, model);
+      });
+
+      window.playEmotion = function(emotion) {
+        try {
+          model.motion(emotion, 0, PIXI.live2d.MotionPriority.NORMAL);
+          model.expression(emotion);
+        } catch (_) {}
+      };
+
+      setInterval(() => {
+        const group = RANDOM_MOTIONS[Math.floor(Math.random() * RANDOM_MOTIONS.length)];
+        try {
+          model.motion(group, 0, PIXI.live2d.MotionPriority.IDLE);
+        } catch (_) {
+          // Some models omit optional motion groups; idle physics still continues.
+        }
+      }, 9000);
+    }
+
+    boot().catch((error) => {
+      const message = error && error.message ? error.message : "Live2D failed to start.";
+      notifyCanvasError(message);
+      showFallback(message);
+      console.error(error);
+    });
+  </script>
+</body>
+</html>
