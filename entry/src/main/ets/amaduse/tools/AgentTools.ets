@@ -129,7 +129,7 @@ export function createAgentToolDefinitions(): AgentToolDefinition[] {
   ));
   definitions.push(createToolDefinition(
     TOOL_NAME_HOST_AGENT,
-    '把前端无法直接完成的任务转发给用户配置的主机后端工具或后端 Agent。适合电脑文件、命令、脚本、搜索、浏览器、MCP、LangGraph 或其他后端能力。普通聊天不要调用；缺少任务目标时先追问。payload_json 必须是 JSON object 字符串。',
+    '把前端无法直接完成的任务转发给用户配置的主机后端工具或后端 Agent。已支持 web_search、todo_task、file_reader、doc_writer，也适合电脑文件、命令、脚本、浏览器、MCP、LangGraph 或其他后端能力。普通聊天不要调用；缺少任务目标时先追问。payload_json 必须是 JSON object 字符串。',
     createHostAgentToolParameters(),
   ));
   return definitions;
@@ -193,9 +193,9 @@ function createHostAgentToolParameters(): AgentToolParameters {
   const properties: AgentToolParameterProperties = {
     action: createSchemaProperty('string', '要执行的操作，只能是 call_tool、call_agent、query_capabilities。'),
     target_type: createSchemaProperty('string', '目标类型：tool、agent 或 auto。无法确定时填 auto。'),
-    target: createSchemaProperty('string', '后端工具名、Agent 名称或能力标识。无法确定时留空，由后端路由。'),
+    target: createSchemaProperty('string', '后端工具名、Agent 名称或能力标识。网页搜索填 web_search；待办任务填 todo_task；读取主机或已上传文件填 file_reader；生成文档填 doc_writer；无法确定时留空，由后端路由。'),
     intent: createSchemaProperty('string', '用户希望主机后端完成的自然语言任务，保留关键约束、文件名、时间、输出格式。'),
-    payload_json: createSchemaProperty('string', '传给后端的参数 JSON object 字符串，例如 {"query":"..."}。没有结构化参数时填 {}。'),
+    payload_json: createSchemaProperty('string', '传给后端的参数 JSON object 字符串。web_search 默认 {"query":"用户要搜索的问题","maxResults":10,"fetchContent":true}；todo_task 使用 {"action":"create|list|update|complete|delete|summary","title":"任务标题"}；file_reader 使用 {"action":"read|list|stat","path":"主机路径或上传后的 hostPath"}；doc_writer 使用 {"instruction":"写作要求","format":"md|txt|docx|csv|xlsx","save":true}。没有结构化参数时填 {}。'),
     endpoint_path: createSchemaProperty('string', '可选相对路径，例如 /api/agent/invoke。通常留空使用设置页默认路径。'),
   };
   return createToolParameters(properties, ['action', 'intent']);
@@ -240,6 +240,8 @@ export function createFallbackAgentToolCall(text: string): AgentToolCall | undef
   if (containsAny(normalized, [
     '主机', '后端', '电脑', 'pc', 'agent', 'mcp', '调用工具', '工具调用',
     '终端', '命令', '脚本', '运行代码', '执行代码', '联网', '搜索', '网页',
+    '待办', 'todo', '任务列表', '读取文件', '文件内容', '附件', '上传文件',
+    '生成文档', '写文档', '导出文档', '报告', 'docx', 'xlsx', 'markdown',
   ])) {
     toolName = TOOL_NAME_HOST_AGENT;
   } else if (containsAny(normalized, ['联系人', '通讯录', '电话', '手机号', '邮箱'])) {
@@ -284,12 +286,14 @@ export function createFallbackAgentToolCall(text: string): AgentToolCall | undef
     };
   }
   if (toolName === TOOL_NAME_HOST_AGENT) {
+    const hostAction = inferHostAction(normalized);
+    const hostTarget = inferHostTarget(normalized);
     args = {
-      action: inferHostAction(normalized),
-      target_type: 'auto',
-      target: '',
+      action: hostAction,
+      target_type: hostTarget.length > 0 ? 'tool' : 'auto',
+      target: hostTarget,
       intent: text,
-      payload_json: '{}',
+      payload_json: createFallbackHostPayloadJson(hostTarget, text, normalized),
       endpoint_path: '',
       query: text,
     };
@@ -394,6 +398,104 @@ function inferHostAction(text: string): string {
     return 'call_agent';
   }
   return 'call_tool';
+}
+
+function inferHostTarget(text: string): string {
+  if (containsAny(text, ['生成文档', '写文档', '导出文档', '创建文档', '保存到本地文件', '本地文件', '报告', 'doc writer', 'doc_writer', 'docx', 'word', 'xlsx', 'markdown'])) {
+    return 'doc_writer';
+  }
+  if (containsAny(text, ['搜索', '联网', '网上', '网页', '查资料', 'web search', 'search', 'web'])) {
+    return 'web_search';
+  }
+  if (containsAny(text, ['待办', 'todo', '任务列表', '任务清单', '添加任务', '完成任务', '删除任务'])) {
+    return 'todo_task';
+  }
+  if (containsAny(text, ['读取文件', '读文件', '文件内容', '打开文件', '查看文件', '附件', '上传文件', 'file_reader'])) {
+    return 'file_reader';
+  }
+  return '';
+}
+
+interface FallbackWebSearchPayload {
+  query: string;
+  maxResults: number;
+  fetchContent: boolean;
+}
+
+function createFallbackWebSearchPayload(query: string): FallbackWebSearchPayload {
+  return {
+    query,
+    maxResults: 10,
+    fetchContent: true,
+  };
+}
+
+function createFallbackHostPayloadJson(target: string, text: string, normalized: string): string {
+  if (target === 'web_search') {
+    return JSON.stringify(createFallbackWebSearchPayload(text));
+  }
+  if (target === 'todo_task') {
+    return JSON.stringify({
+      action: inferTodoTaskAction(normalized),
+      title: text,
+      query: text,
+    });
+  }
+  if (target === 'file_reader') {
+    return JSON.stringify({
+      action: containsAny(normalized, ['列出', '目录', 'list']) ? 'list' : 'read',
+      path: extractMentionedPath(text),
+      maxBytes: 131072,
+    });
+  }
+  if (target === 'doc_writer') {
+    return JSON.stringify({
+      instruction: text,
+      format: inferDocumentFormat(normalized),
+      save: true,
+    });
+  }
+  return '{}';
+}
+
+function inferTodoTaskAction(text: string): string {
+  if (containsAny(text, ['列出', '查看', '查询', '总结', 'summary', 'list'])) {
+    return containsAny(text, ['总结', 'summary']) ? 'summary' : 'list';
+  }
+  if (containsAny(text, ['完成', '做完', 'complete', 'done'])) {
+    return 'complete';
+  }
+  if (containsAny(text, ['删除', '移除', 'delete'])) {
+    return 'delete';
+  }
+  if (containsAny(text, ['修改', '更新', '改成', 'update'])) {
+    return 'update';
+  }
+  return 'create';
+}
+
+function inferDocumentFormat(text: string): string {
+  if (containsAny(text, ['docx', 'word'])) {
+    return 'docx';
+  }
+  if (containsAny(text, ['xlsx', 'excel'])) {
+    return 'xlsx';
+  }
+  if (containsAny(text, ['csv'])) {
+    return 'csv';
+  }
+  if (containsAny(text, ['txt', '纯文本'])) {
+    return 'txt';
+  }
+  return 'md';
+}
+
+function extractMentionedPath(text: string): string {
+  const match = /(agent_uploads[^\s，。；;]*)|([A-Za-z]:[^\s，。；;]*)|(\/[^\s，。；;]*)/.exec(text);
+  if (match !== null && match.length > 0) {
+    return match[0];
+  }
+  return '';
 }
 
 function extractClockTime(text: string): string {

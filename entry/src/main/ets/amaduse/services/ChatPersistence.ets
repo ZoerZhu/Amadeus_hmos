@@ -50,6 +50,11 @@ interface AttachmentStorage {
   id: string;
   label: string;
   kind: string;
+  uri?: string;
+  host_path?: string;
+  content_type?: string;
+  size_bytes?: number;
+  uploaded?: boolean;
 }
 
 interface ToolPreviewStorage {
@@ -433,6 +438,11 @@ function messageToJson(message: ChatMessage): MessageStorage {
       id: attachment.id,
       label: attachment.label,
       kind: attachment.kind,
+      uri: attachment.uri,
+      host_path: attachment.hostPath,
+      content_type: attachment.contentType,
+      size_bytes: attachment.sizeBytes,
+      uploaded: attachment.uploaded,
     };
   });
   return {
@@ -460,6 +470,11 @@ function jsonToMessage(item: MessageStorage): ChatMessage {
       id: stringValue(attachment.id, createId('att')),
       label: stringValue(attachment.label, '附件'),
       kind,
+      uri: stringValue(attachment.uri),
+      hostPath: stringValue(attachment.host_path),
+      contentType: stringValue(attachment.content_type),
+      sizeBytes: numberValue(attachment.size_bytes, 0),
+      uploaded: booleanValue(attachment.uploaded, false),
     };
   }) : [];
   return {

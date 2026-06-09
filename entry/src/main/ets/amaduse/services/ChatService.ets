@@ -1,8 +1,10 @@
 import { http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import {
+  AttachmentKind,
   ChatMessage,
   ChatMode,
+  ComposerAttachment,
   ModelSettings,
   PersonaPreset,
 } from '../model/AppModels';
@@ -24,6 +26,7 @@ import {
   createAgentToolDefinitions,
   createFallbackAgentToolCall,
   isSupportedAgentTool,
+  TOOL_NAME_HOST_AGENT,
 } from '../tools/AgentTools';
 
 export interface AssistantReply {
@@ -139,6 +142,68 @@ interface ToolDecision {
   toolCalls: AgentToolCall[];
 }
 
+interface HostToolContent {
+  ok?: boolean;
+  action?: string;
+  target?: string;
+  summary?: string;
+  response?: HostBackendContent;
+  responseText?: string;
+  error?: string;
+  request?: HostToolRequestContent;
+}
+
+interface HostToolRequestContent {
+  action?: string;
+  target?: string;
+  intent?: string;
+  payload?: HostRequestPayloadContent;
+}
+
+interface HostRequestPayloadContent {
+  query?: string;
+  intent?: string;
+}
+
+interface HostAgentDecisionArguments {
+  action?: string;
+  target_type?: string;
+  target?: string;
+  intent?: string;
+  payload_json?: string;
+  endpoint_path?: string;
+}
+
+interface ForcedDocWriterPayload {
+  instruction: string;
+  format: string;
+  save: boolean;
+  useWebSearch?: boolean;
+  searchQuery?: string;
+}
+
+interface HostBackendContent {
+  ok?: boolean;
+  summary?: string;
+  message?: string;
+  text?: string;
+  error?: string;
+  data?: HostBackendDataContent;
+}
+
+interface HostBackendDataContent {
+  tool?: string;
+  result?: HostSearchResultContent;
+  answer?: string;
+  query?: string;
+}
+
+interface HostSearchResultContent {
+  answer?: string;
+  summary?: string;
+  query?: string;
+}
+
 export class ChatService {
   static async requestAssistantMessage(
     history: ChatMessage[],
@@ -149,7 +214,7 @@ export class ChatService {
   ): Promise<AssistantReply> {
     if (looksLikeLocalToolRequest(userText) && (!settings.useRemote || settings.apiKey.length === 0)) {
       return {
-        text: '[emotion:neutral]\n我识别到这是一个工具请求。鸿蒙迁移版已经保留了工具入口和参数收集逻辑，但系统闹钟、日历、文件创建、语音播报这些平台级执行还需要继续接入 HarmonyOS 对应 API。先把目标、时间和内容说完整，我会按同样的流程整理参数。',
+        text: '[emotion:neutral]\n我识别到这是一个工具请求。鸿蒙版已经保留了工具入口和参数收集逻辑，但系统闹钟、日历、文件创建、语音播报这些平台级执行还需要继续接入 HarmonyOS 对应 API。先把目标、时间和内容说完整，我会按同样的流程整理参数。',
         thinking: '',
         error: '',
       };
@@ -302,10 +367,7 @@ export class ChatService {
     payload.stream = false;
     payload.tools = createAgentToolDefinitions();
     payload.tool_choice = 'auto';
-    payload.messages.splice(1, 0, createChatCompletionMessage(
-      'system',
-      '你可以调用工具完成明确的外部动作：系统闹钟、系统日历、系统联系人，以及 host_agent_tool。host_agent_tool 会把任务转发给用户配置的主机后端工具或后端 Agent，适合电脑文件、命令、脚本、搜索、浏览器、MCP、LangGraph 或其他前端无法直接完成的能力。只有用户确实需要这些外部能力时才调用工具；普通聊天、解释、推理不要调用。缺少关键字段时先追问。endpoint_path 通常留空，payload_json 必须是 JSON object 字符串。工具返回后，根据结果生成简短自然语言回复。',
-    ));
+    payload.messages.splice(1, 0, createChatCompletionMessage('system', hostAgentToolInstruction()));
 
     const decisionResponse = await ChatService.requestCompletionPayload(endpoint, payload, settings);
     if (decisionResponse.code < 200 || decisionResponse.code > 299) {
@@ -315,7 +377,8 @@ export class ChatService {
     if (decision.error.length > 0) {
       return { text: '', thinking: decision.thinking, error: decision.error };
     }
-    if (decision.toolCalls.length === 0) {
+    const toolCalls = normalizeToolCallsForUserIntent(userText, decision.toolCalls);
+    if (toolCalls.length === 0) {
       return {
         text: decision.text.length > 0 ? decision.text : '[emotion:neutral]\n模型没有返回正文。',
         thinking: decision.thinking,
@@ -324,13 +387,24 @@ export class ChatService {
     }
 
     const toolMessages = payload.messages.slice();
-    toolMessages.push(createAssistantToolChatMessage(decision.message));
-    for (let index = 0; index < decision.toolCalls.length; index += 1) {
-      const call = decision.toolCalls[index];
+    toolMessages.push(createAssistantToolChatMessageForCalls(toolCalls, decision.message));
+    let directToolFailureReply = '';
+    for (let index = 0; index < toolCalls.length; index += 1) {
+      const call = toolCalls[index];
       toolCallbacks.onToolCallStart(call);
       const result = await toolCallbacks.executeTool(call);
       toolCallbacks.onToolCallFinish(result);
+      if (directToolFailureReply.length === 0) {
+        directToolFailureReply = createDirectHostWebSearchFailureReply(call, result);
+      }
       toolMessages.push(createToolResultChatMessage(result));
+    }
+    if (directToolFailureReply.length > 0) {
+      return {
+        text: `[emotion:neutral]\n${directToolFailureReply}`,
+        thinking: '',
+        error: '',
+      };
     }
 
     const finalPayload = ChatService.buildPayload(settings, persona, mode, []);
@@ -512,9 +586,11 @@ export class ChatService {
       memoryFacts: [],
     };
     messages.push(createChatCompletionMessage('system', PersonaPromptBuilder.build(persona, promptContext)));
-    const recent = history.filter((message: ChatMessage) => message.text.trim().length > 0).slice(-12);
+    const recent = history.filter((message: ChatMessage) => {
+      return message.text.trim().length > 0 || message.attachments.length > 0;
+    }).slice(-12);
     recent.forEach((message: ChatMessage) => {
-      messages.push(createChatCompletionMessage(message.isAgent ? 'assistant' : 'user', message.text));
+      messages.push(createChatCompletionMessage(message.isAgent ? 'assistant' : 'user', messageContentForPayload(message)));
     });
 
     const config: ChatCompletionModeConfig = {
@@ -566,6 +642,50 @@ export class ChatService {
   }
 }
 
+function hostAgentToolInstruction(): string {
+  return '你可以调用工具完成明确的外部动作：系统闹钟、系统日历、系统联系人，以及 host_agent_tool。host_agent_tool 会把任务转发给用户配置的主机后端工具或后端 Agent。已知主机后端工具：web_search 用于联网检索，todo_task 用于待办任务增删改查和总结，file_reader 用于读取、列出或查看主机文件，doc_writer 用于生成并保存 md/txt/docx/csv/xlsx 文档。只要用户要求生成、整理、导出或保存文档/报告/本地文件/docx/word/xlsx/markdown，就必须直接调用 target=doc_writer，不要先调用 web_search；如果文档需要联网资料，把 useWebSearch:true 和 searchQuery 写进 doc_writer 的 payload_json。网页搜索必须调用 host_agent_tool，并设置 action=call_tool、target_type=tool、target=web_search、payload_json={"query":"用户要搜索的问题","maxResults":10,"fetchContent":true}；只有用户明确要求轻量快速检索且没有文档生成要求时才把 fetchContent 设为 false。待办任务调用 target=todo_task，payload_json 至少包含 action 和 title/query。读取用户上传附件时调用 target=file_reader，并使用消息中 [移动端附件] 的 hostPath 作为 path。生成文档时调用 target=doc_writer，payload_json 至少包含 instruction、format、save:true；如果用户要求根据上传文件生成文档，先用 file_reader 读取 hostPath，再调用 doc_writer。普通聊天、解释、推理不要调用工具；缺少关键字段时先追问。endpoint_path 通常留空，payload_json 必须是 JSON object 字符串。工具返回后，根据工具 JSON 生成完整总结正文；正文优先使用 Markdown 的标题、列表、加粗、引用或代码块组织；不要把候选来源列表原样作为正文，候选来源已经展示在调用结果中。';
+}
+
+function messageContentForPayload(message: ChatMessage): string {
+  const text = message.text.trim();
+  const attachmentText = attachmentsPromptText(message.attachments);
+  if (attachmentText.length === 0) {
+    return message.text;
+  }
+  if (text.length === 0) {
+    return attachmentText;
+  }
+  return `${message.text}\n\n${attachmentText}`;
+}
+
+function attachmentsPromptText(attachments: ComposerAttachment[]): string {
+  if (attachments.length === 0) {
+    return '';
+  }
+  const lines: string[] = ['[移动端附件]'];
+  attachments.forEach((attachment: ComposerAttachment, index: number) => {
+    const kind = attachment.kind === AttachmentKind.Image ? '图片' : '文件';
+    const hostPath = stringValue(attachment.hostPath);
+    const parts: string[] = [
+      `${index + 1}. ${kind}: ${attachment.label}`,
+    ];
+    if (hostPath.length > 0) {
+      parts.push(`hostPath=${hostPath}`);
+      parts.push('可由 host_agent_tool target=file_reader 读取');
+    }
+    const contentType = stringValue(attachment.contentType);
+    if (contentType.length > 0) {
+      parts.push(`contentType=${contentType}`);
+    }
+    const sizeBytes = attachment.sizeBytes === undefined ? 0 : attachment.sizeBytes;
+    if (sizeBytes > 0) {
+      parts.push(`sizeBytes=${sizeBytes}`);
+    }
+    lines.push(parts.join('；'));
+  });
+  return lines.join('\n');
+}
+
 function createHttpHeaders(settings: ModelSettings, accept: string): HttpHeaderMap {
   const headers: HttpHeaderMap = {
     'Content-Type': 'application/json',
@@ -613,6 +733,155 @@ function parseAgentToolCalls(message: ChatCompletionResponseMessage): AgentToolC
   return calls;
 }
 
+function normalizeToolCallsForUserIntent(userText: string, calls: AgentToolCall[]): AgentToolCall[] {
+  if (!looksLikeDocumentWriterRequest(userText)) {
+    return calls;
+  }
+  if (calls.some((call: AgentToolCall): boolean => isHostTargetCall(call, 'doc_writer'))) {
+    return calls;
+  }
+  if (calls.length === 0) {
+    return [createForcedDocWriterCall('', userText)];
+  }
+  const normalized: AgentToolCall[] = [];
+  let insertedDocWriter = false;
+  calls.forEach((call: AgentToolCall) => {
+    if (isHostWebSearchToolCall(call)) {
+      normalized.push(createForcedDocWriterCall(call.id, userText));
+      insertedDocWriter = true;
+      return;
+    }
+    normalized.push(call);
+  });
+  if (!insertedDocWriter && normalized.every((call: AgentToolCall): boolean => call.name !== TOOL_NAME_HOST_AGENT)) {
+    normalized.push(createForcedDocWriterCall('', userText));
+  }
+  return normalized;
+}
+
+function createForcedDocWriterCall(id: string, userText: string): AgentToolCall {
+  const payload: ForcedDocWriterPayload = {
+    instruction: userText,
+    format: inferRequestedDocumentFormat(userText),
+    save: true,
+  };
+  if (documentRequestNeedsResearch(userText)) {
+    payload.useWebSearch = true;
+    payload.searchQuery = userText;
+  }
+  const args: HostAgentDecisionArguments = {
+    action: 'call_tool',
+    target_type: 'tool',
+    target: 'doc_writer',
+    intent: userText,
+    payload_json: JSON.stringify(payload),
+    endpoint_path: '',
+  };
+  return createAgentToolCall(id, TOOL_NAME_HOST_AGENT, JSON.stringify(args));
+}
+
+function isHostTargetCall(call: AgentToolCall, targetName: string): boolean {
+  if (call.name !== TOOL_NAME_HOST_AGENT) {
+    return false;
+  }
+  const args = parseHostAgentDecisionArguments(call.argumentsJson);
+  const target = stringValue(args.target).toLowerCase();
+  if (target === targetName || target === `${targetName}_agent`) {
+    return true;
+  }
+  const payload = stringValue(args.payload_json).toLowerCase();
+  return payload.indexOf(targetName) >= 0;
+}
+
+function isHostWebSearchToolCall(call: AgentToolCall): boolean {
+  if (call.name !== TOOL_NAME_HOST_AGENT) {
+    return false;
+  }
+  const args = parseHostAgentDecisionArguments(call.argumentsJson);
+  const target = stringValue(args.target).toLowerCase();
+  if (target === 'web_search' || target === 'web_search_agent') {
+    return true;
+  }
+  return isHostWebSearchCall(call.argumentsJson);
+}
+
+function parseHostAgentDecisionArguments(argumentsJson: string): HostAgentDecisionArguments {
+  try {
+    return JSON.parse(argumentsJson) as HostAgentDecisionArguments;
+  } catch (_) {
+    return {};
+  }
+}
+
+function createDirectHostWebSearchFailureReply(call: AgentToolCall, result: AgentToolResult): string {
+  if (call.name !== TOOL_NAME_HOST_AGENT) {
+    return '';
+  }
+  const payload = parseHostToolContent(result.content);
+  if (payload === undefined) {
+    return isHostWebSearchCall(call.argumentsJson) && !result.ok ? `Web Search 调用失败：${hostToolFallbackText(result)}` : '';
+  }
+  if (!isHostWebSearchPayload(call.argumentsJson, payload)) {
+    return '';
+  }
+  if (!result.ok || payload.ok === false) {
+    return `Web Search 调用失败：${hostToolFallbackText(result)}`;
+  }
+  return '';
+}
+
+function parseHostToolContent(content: string): HostToolContent | undefined {
+  try {
+    return JSON.parse(content) as HostToolContent;
+  } catch (_) {
+    return undefined;
+  }
+}
+
+function isHostWebSearchPayload(argumentsJson: string, payload: HostToolContent): boolean {
+  const responseData = payload.response?.data;
+  const toolName = stringValue(responseData?.tool);
+  if (toolName === 'web_search') {
+    return true;
+  }
+  const target = `${stringValue(payload.target)} ${stringValue(payload.request?.target)}`.toLowerCase();
+  if (target.indexOf('web_search') >= 0) {
+    return true;
+  }
+  return isHostWebSearchCall(argumentsJson);
+}
+
+function isHostWebSearchCall(argumentsJson: string): boolean {
+  const lower = argumentsJson.toLowerCase();
+  const words = ['web_search', 'web search', '搜索', '联网', '网上', '网页', '查资料', 'search'];
+  return words.some((word: string): boolean => lower.indexOf(word) >= 0);
+}
+
+function hostWebSearchAnswer(payload: HostToolContent): string {
+  const response = payload.response;
+  if (response === undefined) {
+    return stringValue(payload.summary, stringValue(payload.responseText));
+  }
+  const data = response.data;
+  const result = data?.result;
+  const answer = stringValue(result?.answer,
+    stringValue(data?.answer,
+      stringValue(result?.summary,
+        stringValue(response.summary,
+          stringValue(response.message,
+            stringValue(response.text,
+              stringValue(payload.summary)))))));
+  return answer.trim();
+}
+
+function hostToolFallbackText(result: AgentToolResult): string {
+  const summary = result.summary.trim();
+  if (summary.length > 0) {
+    return summary;
+  }
+  return result.content.substring(0, 800);
+}
+
 function createAssistantToolChatMessage(message: ChatCompletionResponseMessage): ChatCompletionMessage {
   const rawToolCalls = message.tool_calls;
   if (Array.isArray(rawToolCalls)) {
@@ -625,6 +894,30 @@ function createAssistantToolChatMessage(message: ChatCompletionResponseMessage):
   return {
     role: 'assistant',
     content: stringValue(message.content),
+  };
+}
+
+function createAssistantToolChatMessageForCalls(
+  calls: AgentToolCall[],
+  message: ChatCompletionResponseMessage,
+): ChatCompletionMessage {
+  if (calls.length === 0) {
+    return createAssistantToolChatMessage(message);
+  }
+  const toolCalls: ChatCompletionToolCall[] = calls.map((call: AgentToolCall): ChatCompletionToolCall => {
+    return {
+      id: call.id,
+      type: 'function',
+      function: {
+        name: call.name,
+        arguments: call.argumentsJson,
+      },
+    };
+  });
+  return {
+    role: 'assistant',
+    content: stringValue(message.content),
+    tool_calls: toolCalls,
   };
 }
 
@@ -818,11 +1111,49 @@ function looksLikeAgentToolRequest(text: string): boolean {
     '主机', '后端', '电脑', 'pc', 'agent', 'mcp', 'langgraph', '调用工具',
     '工具调用', '有什么工具', '哪些工具', '能力列表', '终端', '命令', '脚本',
     '运行代码', '执行代码', '创建文件', '保存文件', '生成文件', '写入文件',
-    '搜索', '联网', '网上', '网页', '浏览器', '爬取', '下载',
+    '搜索', '联网', '网上', '网页', '浏览器', '爬取', '下载', '上传文件',
+    '待办', '任务清单', '任务列表', 'todo', '读取文件', '读文件', '文件内容',
+    '附件', '生成文档', '写文档', '导出文档', '报告', 'doc_writer', 'file_reader',
     'alarm', 'calendar', 'schedule', 'contact',
     'tool', 'backend', 'host', 'computer', 'command', 'script', 'search', 'web',
+    'todo_task', 'docx', 'xlsx', 'markdown',
   ];
   return words.some((word: string): boolean => normalized.indexOf(word) >= 0);
+}
+
+function looksLikeDocumentWriterRequest(text: string): boolean {
+  const normalized = text.toLowerCase();
+  if (containsAny(normalized, [
+    'docx', 'word', '总结成', '整理成', '写成', '生成文件',
+    '生成文档', '保存文档', '保存到本地文件', '本地文件', '导出文档', '导出文件',
+    'markdown', 'md文件', 'txt文件', 'csv', 'xlsx', 'excel',
+  ])) {
+    return true;
+  }
+  return containsAny(normalized, ['文档', '报告']) &&
+    containsAny(normalized, ['生成', '写', '保存', '导出', '总结成', '整理成']);
+}
+
+function inferRequestedDocumentFormat(text: string): string {
+  const normalized = text.toLowerCase();
+  if (containsAny(normalized, ['docx', 'word'])) {
+    return 'docx';
+  }
+  if (containsAny(normalized, ['xlsx', 'excel'])) {
+    return 'xlsx';
+  }
+  if (normalized.indexOf('csv') >= 0) {
+    return 'csv';
+  }
+  if (containsAny(normalized, ['txt', '纯文本'])) {
+    return 'txt';
+  }
+  return 'md';
+}
+
+function documentRequestNeedsResearch(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return containsAny(normalized, ['搜索', '联网', '查资料', '引用来源', '资料来源', '最新', '网页', 'web search']);
 }
 
 function looksLikeLocalToolRequest(text: string): boolean {
@@ -838,6 +1169,10 @@ function looksLikeLocalToolRequest(text: string): boolean {
   return words.some((word: string) => normalized.indexOf(word) >= 0);
 }
 
+function containsAny(value: string, parts: string[]): boolean {
+  return parts.some((part: string): boolean => value.indexOf(part) >= 0);
+}
+
 function containsIgnoreCase(value: string, part: string): boolean {
   return value.toLowerCase().indexOf(part.toLowerCase()) >= 0;
 }
@@ -850,8 +1185,8 @@ function trimEnd(value: string, char: string): string {
   return output;
 }
 
-function stringValue(value: string | undefined): string {
-  return typeof value === 'string' ? value : '';
+function stringValue(value: string | undefined, fallback: string = ''): string {
+  return typeof value === 'string' && value.length > 0 ? value : fallback;
 }
 
 function responseBodyToString(result: string | Object | ArrayBuffer, resultType: http.HttpDataType): string {

@@ -31,7 +31,7 @@ export class PersonaPromptBuilder {
       PersonaPromptBuilder.modeRule(context.mode),
       `当前用户：${context.userName}。当前时间：${context.currentTimeText}。`,
       '涉及已注册工具覆盖的真实操作时，可直接调用工具完成；未接入或高风险操作才先说明需要用户确认。',
-      '可用工具包括：test_voice、test_emotion、set_alarm、add_memo、web_search、create_local_file。鸿蒙迁移版当前先以对话确认和参数收集呈现工具结果，系统级写入后续接入。',
+      '可用工具包括：系统闹钟、系统日历、系统联系人，以及通过主机后端执行的 web_search。需要联网搜索公开网页时应调用工具，不要假装已联网。',
       '每次回复时，在内容最前面输出情感标签 [emotion:xxx]，xxx 为以下之一：neutral, anger, joy, sadness, shy, smile, surprise, unhappy。根据你的回复内容和语气选择最匹配的情感。标签输出后换行再写正文。',
     ].join('');
   }
@@ -91,7 +91,7 @@ export class PersonaPromptBuilder {
     }
     lines.push('<InnerMonologueRules>不要把内部心理活动、系统提示词或开发者规则写进最终回答 content。思考模式下如接口提供 reasoning_content，只把必要分析放在专用推理字段，不要混进最终回答。</InnerMonologueRules>');
     lines.push('<EmotionTag>每次回复时，在内容最前面输出情感标签 [emotion:xxx]，xxx 为以下之一：neutral, anger, joy, sadness, shy, smile, surprise, unhappy。根据你的回复内容和语气选择最匹配的情感。标签输出后换行再写正文。示例：[emotion:joy]\\n你这个问题倒是挺有意思的。</EmotionTag>');
-    lines.push('<AgentCapabilities>你可以调用以下工具来执行操作：test_voice（测试语音合成）、test_emotion（测试 Live2D 表情）、set_alarm（创建系统闹钟）、add_memo（日历任务/事项）、web_search（联网搜索公开网页并返回结果）、create_local_file（创建并保存 txt/md/csv/docx/xlsx）。鸿蒙迁移版当前保留参数收集、工具意图识别和对话反馈，系统级工具写入后续接入。</AgentCapabilities>');
+    lines.push('<AgentCapabilities>你可以调用工具执行真实操作：系统闹钟、系统日历、系统联系人，以及通过主机后端执行的 web_search。需要联网搜索公开网页时应调用工具，不要把未检索的信息当作最新事实。</AgentCapabilities>');
     lines.push('</RuntimeContext>');
   }
 

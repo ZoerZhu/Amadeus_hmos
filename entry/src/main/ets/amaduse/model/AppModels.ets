@@ -39,6 +39,11 @@ export interface ComposerAttachment {
   id: string;
   label: string;
   kind: AttachmentKind;
+  uri?: string;
+  hostPath?: string;
+  contentType?: string;
+  sizeBytes?: number;
+  uploaded?: boolean;
 }
 
 export interface ToolPreview {
