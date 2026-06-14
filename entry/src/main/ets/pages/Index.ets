@@ -42,10 +42,12 @@ import {
 } from '../amaduse/services/ChatPersistence';
 import { ChatService } from '../amaduse/services/ChatService';
 import {
+  CodeTaskBridgeStream,
   CodeTaskDetail,
   CodeTaskEventPayload,
   CodeTaskEventRecord,
   CodeTaskMessageResult,
+  CodeTaskMobileViewSnapshot,
   CodeTaskQuestionItem,
   CodeTaskQuestionOption,
   CodeTaskQuestionPayload,
@@ -53,6 +55,11 @@ import {
   CodeTaskRemoteService,
   CodeTaskSnapshotMessage,
   CodeTaskSummary,
+  CodeTaskViewMessage,
+  CodeTaskViewPhase,
+  CodeTaskViewQuestion,
+  CodeTaskViewRecord,
+  CodeTaskViewTurn,
 } from '../amaduse/services/CodeTaskRemoteService';
 import {
   VoicePlaybackCallbacks,
@@ -101,6 +108,7 @@ const HISTORY_FILE_BINARY_PREVIEW_BYTES = 96;
 const CODE_TASK_REOPEN_REFRESH_DELAY_MS = 900;
 const CODE_TASK_REOPEN_REFRESH_RETRY_MS = 2200;
 const CODE_TASK_LIST_REFRESH_INTERVAL_MS = 10000;
+const CODE_TASK_BRIDGE_HEARTBEAT_MS = 12000;
 const PAGE_SLIDE_WIDTH = 420;
 const TRANSCRIPT_COLLAPSED_PERCENT = 36;
 const TRANSCRIPT_EXPANDED_PERCENT = 84;
@@ -1308,6 +1316,7 @@ struct Index {
   @State private codeTaskSending: boolean = false;
   @State private codeTaskReplying: boolean = false;
   @State private codeTaskConnectionMessage: string = '';
+  @State private codeTaskBridgeConnected: boolean = false;
 
   @State private editModelId: string = '';
   @State private editProvider: ModelProviderPreset = defaultModelProvider();
@@ -1329,8 +1338,17 @@ struct Index {
   private pageDragStartProgress: number = 0;
   private codeTaskDragStartProgress: number = 0;
   private codeTaskAutoScrolling: boolean = false;
+  private codeTaskApplyingHostUpdate: boolean = false;
+  private codeTaskScrollTimer: number = -1;
+  private codeTaskScrollSettleTimer: number = -1;
+  private codeTaskHostUpdateTimer: number = -1;
   private codeTaskRefreshTimer: number = -1;
   private codeTaskReopenRefreshTimer: number = -1;
+  private codeTaskBridge?: CodeTaskBridgeStream;
+  private codeTaskBridgeReconnectTimer: number = -1;
+  private codeTaskBridgeHeartbeatTimer: number = -1;
+  @State private codeTaskViewSnapshots: CodeTaskMobileViewSnapshot[] = [];
+  private codeTaskLastViewSeq: number = 0;
   private codeTaskPendingQuestionReplyTaskId: string = '';
   private codeTaskPendingQuestionReplyRequestId: string = '';
 
@@ -1341,6 +1359,8 @@ struct Index {
   aboutToDisappear(): void {
     this.stopCodeTaskListRefresh();
     this.clearCodeTaskReopenRefresh();
+    this.clearCodeTaskScrollTimers();
+    this.disconnectCodeTaskBridge();
   }
 
   private abilityContext(): common.UIAbilityContext {
@@ -2267,6 +2287,7 @@ struct Index {
         this.codeTaskDetailPanel();
       } else {
         this.codeTaskEmptySelectionPanel();
+        this.codeTaskComposer();
       }
     }
     .layoutWeight(1)
@@ -2390,7 +2411,7 @@ struct Index {
         .fontSize(18)
         .fontWeight(FontWeight.Bold)
         .fontColor(INK_BLACK)
-      Text(this.codeTaskConnectionMessage.length > 0 ? this.codeTaskConnectionMessage : '主机返回的 OpenCode 任务会在上方显示。')
+      Text(this.codeTaskConnectionMessage.length > 0 ? this.codeTaskConnectionMessage : '输入任务后会发送到主机端，主机处理过程会同步到这里。')
         .fontSize(13)
         .fontColor('#777777')
         .lineHeight(20)
@@ -2446,7 +2467,7 @@ struct Index {
             }, (turn: CodeTaskConversationTurn) => turn.id)
           }
           .width('100%')
-          .padding({ bottom: 8 })
+          .padding({ bottom: 24 })
         }
         .width('100%')
         .height('100%')
@@ -2918,7 +2939,8 @@ struct Index {
     Row() {
       TextArea({
         text: this.codeTaskMessageDraft,
-        placeholder: this.codeTaskSending ? '正在发送...' : '推进这个任务',
+        placeholder: this.codeTaskSending ? '正在发送...' :
+          (this.selectedCodeTaskId.length > 0 ? '推进这个任务' : '输入要交给主机完成的任务'),
       })
         .fontSize(15)
         .fontColor(INK_BLACK)
@@ -4056,6 +4078,9 @@ struct Index {
     if (!CodeTaskRemoteService.isConfigured(this.hostAgentSettings)) {
       return '未配置远程主机';
     }
+    if (this.codeTaskBridgeConnected) {
+      return this.codeTaskConnectionMessage.length > 0 ? this.codeTaskConnectionMessage : '已连接主机 bridge';
+    }
     if (this.codeTaskConnectionMessage.length > 0) {
       return this.codeTaskConnectionMessage;
     }
@@ -4078,12 +4103,7 @@ struct Index {
   }
 
   private startCodeTaskListRefresh(): void {
-    if (this.codeTaskRefreshTimer >= 0) {
-      return;
-    }
-    this.codeTaskRefreshTimer = setInterval(() => {
-      this.refreshCodeTasksIfIdle();
-    }, CODE_TASK_LIST_REFRESH_INTERVAL_MS);
+    this.connectCodeTaskBridge();
   }
 
   private stopCodeTaskListRefresh(): void {
@@ -4091,6 +4111,129 @@ struct Index {
       clearInterval(this.codeTaskRefreshTimer);
       this.codeTaskRefreshTimer = -1;
     }
+  }
+
+  private connectCodeTaskBridge(): void {
+    if (!CodeTaskRemoteService.isConfigured(this.hostAgentSettings)) {
+      return;
+    }
+    if (this.codeTaskBridge !== undefined) {
+      return;
+    }
+    if (this.codeTaskBridgeReconnectTimer >= 0) {
+      clearTimeout(this.codeTaskBridgeReconnectTimer);
+      this.codeTaskBridgeReconnectTimer = -1;
+    }
+    this.codeTaskConnectionMessage = '正在连接主机 bridge...';
+    try {
+      this.codeTaskBridge = CodeTaskRemoteService.connectBridge(this.hostAgentSettings, {
+        onOpen: (): void => {
+          this.codeTaskBridgeConnected = true;
+          this.codeTaskConnectionMessage = 'bridge 已打开，等待主机快照...';
+          this.startCodeTaskBridgeHeartbeat();
+        },
+        onHello: (message: string): void => {
+          this.codeTaskBridgeConnected = true;
+          this.codeTaskConnectionMessage = message.length > 0 ? '已连接主机 bridge' : '已连接主机 bridge';
+          this.startCodeTaskBridgeHeartbeat();
+          this.refreshCodeTasks();
+        },
+        onView: (view: CodeTaskMobileViewSnapshot, seq: number): void => {
+          this.codeTaskBridgeConnected = true;
+          this.codeTaskLastViewSeq = Math.max(this.codeTaskLastViewSeq, seq);
+          this.applyCodeTaskMobileView(view);
+        },
+        onError: (message: string): void => {
+          this.handleCodeTaskBridgeFailure(`bridge 错误：${message.substring(0, 80)}`);
+        },
+        onDone: (): void => {
+          this.codeTaskBridgeConnected = false;
+          this.codeTaskBridge = undefined;
+          this.stopCodeTaskBridgeHeartbeat();
+          if (this.codeTaskProgress > 0 && CodeTaskRemoteService.isConfigured(this.hostAgentSettings)) {
+            this.scheduleCodeTaskBridgeReconnect();
+          }
+        },
+      });
+      this.startCodeTaskBridgeHeartbeat();
+    } catch (error) {
+      this.codeTaskBridge = undefined;
+      this.codeTaskBridgeConnected = false;
+      this.stopCodeTaskBridgeHeartbeat();
+      this.codeTaskConnectionMessage = `bridge 连接失败：${errorToString(error).substring(0, 80)}`;
+      this.scheduleCodeTaskBridgeReconnect();
+    }
+  }
+
+  private scheduleCodeTaskBridgeReconnect(): void {
+    if (this.codeTaskBridgeReconnectTimer >= 0 || this.codeTaskProgress <= 0) {
+      return;
+    }
+    this.codeTaskBridgeReconnectTimer = setTimeout((): void => {
+      this.codeTaskBridgeReconnectTimer = -1;
+      this.connectCodeTaskBridge();
+    }, 3000);
+  }
+
+  private startCodeTaskBridgeHeartbeat(): void {
+    if (this.codeTaskBridgeHeartbeatTimer >= 0) {
+      return;
+    }
+    this.codeTaskBridgeHeartbeatTimer = setInterval((): void => {
+      this.pingCodeTaskBridge();
+    }, CODE_TASK_BRIDGE_HEARTBEAT_MS);
+  }
+
+  private stopCodeTaskBridgeHeartbeat(): void {
+    if (this.codeTaskBridgeHeartbeatTimer >= 0) {
+      clearInterval(this.codeTaskBridgeHeartbeatTimer);
+      this.codeTaskBridgeHeartbeatTimer = -1;
+    }
+  }
+
+  private pingCodeTaskBridge(): void {
+    if (this.codeTaskProgress <= 0 || this.codeTaskBridge === undefined) {
+      return;
+    }
+    this.codeTaskBridge.ping().then((): void => {
+      this.codeTaskBridgeConnected = true;
+    }).catch((error: Error | Object | string): void => {
+      const message = errorToString(error);
+      if (message.indexOf('已有主机指令正在提交') >= 0) {
+        return;
+      }
+      this.handleCodeTaskBridgeFailure(`bridge 心跳失败：${message.substring(0, 80)}`);
+    });
+  }
+
+  private handleCodeTaskBridgeFailure(message: string): void {
+    this.codeTaskConnectionMessage = message;
+    this.stopCodeTaskBridgeHeartbeat();
+    if (this.codeTaskBridge !== undefined) {
+      try {
+        this.codeTaskBridge.close();
+      } catch (_) {
+      }
+      this.codeTaskBridge = undefined;
+    }
+    this.codeTaskBridgeConnected = false;
+    if (this.codeTaskProgress > 0 && CodeTaskRemoteService.isConfigured(this.hostAgentSettings)) {
+      this.scheduleCodeTaskBridgeReconnect();
+      this.refreshCodeTasks();
+    }
+  }
+
+  private disconnectCodeTaskBridge(): void {
+    if (this.codeTaskBridgeReconnectTimer >= 0) {
+      clearTimeout(this.codeTaskBridgeReconnectTimer);
+      this.codeTaskBridgeReconnectTimer = -1;
+    }
+    this.stopCodeTaskBridgeHeartbeat();
+    if (this.codeTaskBridge !== undefined) {
+      this.codeTaskBridge.close();
+      this.codeTaskBridge = undefined;
+    }
+    this.codeTaskBridgeConnected = false;
   }
 
   private refreshCodeTasksIfIdle(): void {
@@ -4116,9 +4259,17 @@ struct Index {
       this.codeTaskConnectionMessage = '请先配置远程主机。';
       return;
     }
+    this.connectCodeTaskBridge();
     this.codeTaskLoading = true;
-    this.codeTaskConnectionMessage = '正在连接主机...';
+    this.codeTaskConnectionMessage = this.codeTaskBridgeConnected ? '正在读取主机任务视图...' : '正在连接主机...';
     try {
+      const views = await CodeTaskRemoteService.listTaskViews(this.hostAgentSettings);
+      if (views.length > 0) {
+        this.syncCodeTaskMobileViewRecords(views);
+        this.codeTaskConnectionMessage = '已同步主机任务视图';
+        return;
+      }
+      this.codeTaskViewSnapshots = [];
       const tasks = await CodeTaskRemoteService.listTasks(this.hostAgentSettings);
       this.codeTasks = tasks;
       this.codeTaskConnectionMessage = tasks.length > 0 ? '已连接主机' : '主机暂无 OpenCode 任务。';
@@ -4159,6 +4310,18 @@ struct Index {
       this.codeTaskLoading = true;
     }
     try {
+      const cachedView = this.findCodeTaskMobileView(task.id);
+      if (cachedView !== undefined) {
+        const wasAtBottom = sameTask ? this.shouldAutoFollowCodeTaskBottom() : true;
+        this.applyCodeTaskMobileView(cachedView, true, false);
+        this.codeTaskConnectionMessage = '已打开主机任务视图';
+        if (sameTask) {
+          this.preserveCodeTaskScrollAfterUpdate(wasAtBottom);
+        } else {
+          this.scrollCodeTaskToBottom(true);
+        }
+        return;
+      }
       const detail = await CodeTaskRemoteService.getTaskDetail(this.hostAgentSettings, task.id);
       const wasAtBottom = sameTask ? this.shouldAutoFollowCodeTaskBottom() : true;
       this.applyCodeTaskDetail(detail);
@@ -4216,6 +4379,359 @@ struct Index {
     if (!preserveLocalProcessing) {
       this.upsertCodeTaskSummary(task);
     }
+  }
+
+  private findCodeTaskMobileView(taskId: string): CodeTaskMobileViewSnapshot | undefined {
+    return this.codeTaskViewSnapshots.find((view: CodeTaskMobileViewSnapshot): boolean => {
+      return this.codeTaskMobileViewTaskId(view) === taskId;
+    });
+  }
+
+  private syncCodeTaskMobileViewRecords(records: CodeTaskViewRecord[]): void {
+    const views: CodeTaskMobileViewSnapshot[] = [];
+    records.forEach((record: CodeTaskViewRecord): void => {
+      if (record.snapshot === undefined) {
+        return;
+      }
+      if (this.isCodeTaskMobileViewDeleted(record.snapshot)) {
+        this.removeCodeTaskMobileView(this.codeTaskMobileViewTaskId(record.snapshot));
+        return;
+      }
+      views.push(record.snapshot);
+    });
+    const activeIds: string[] = [];
+    views.forEach((view: CodeTaskMobileViewSnapshot): void => {
+      const taskId = this.codeTaskMobileViewTaskId(view);
+      if (taskId.length > 0 && activeIds.indexOf(taskId) < 0) {
+        activeIds.push(taskId);
+      }
+    });
+    if (activeIds.length === 0) {
+      this.codeTaskViewSnapshots = [];
+      this.codeTasks = [];
+      this.clearSelectedCodeTask();
+      return;
+    }
+    if (this.selectedCodeTaskId.length > 0 && activeIds.indexOf(this.selectedCodeTaskId) < 0) {
+      this.clearSelectedCodeTask();
+    }
+    this.codeTaskViewSnapshots = [];
+    this.codeTasks = [];
+    views.forEach((view: CodeTaskMobileViewSnapshot): void => {
+      this.applyCodeTaskMobileView(view);
+    });
+  }
+
+  private applyCodeTaskMobileView(
+    view: CodeTaskMobileViewSnapshot,
+    forceSelect: boolean = false,
+    updateScroll: boolean = true,
+  ): void {
+    const taskId = this.codeTaskMobileViewTaskId(view);
+    if (taskId.length === 0) {
+      return;
+    }
+    if (this.isCodeTaskMobileViewDeleted(view)) {
+      this.removeCodeTaskMobileView(taskId);
+      return;
+    }
+    const existingIndex = this.codeTaskViewSnapshots.findIndex((item: CodeTaskMobileViewSnapshot): boolean => {
+      return this.codeTaskMobileViewTaskId(item) === taskId;
+    });
+    if (existingIndex >= 0) {
+      const next = this.codeTaskViewSnapshots.slice();
+      next[existingIndex] = view;
+      this.codeTaskViewSnapshots = next;
+    } else {
+      this.codeTaskViewSnapshots = this.codeTaskViewSnapshots.concat([view]);
+    }
+
+    const summary = this.codeTaskSummaryFromMobileView(view);
+    this.upsertCodeTaskSummary(summary);
+    
+    // 判断是否需要选中并更新UI
+    const shouldSelect = forceSelect || this.selectedCodeTaskId.length === 0 || this.selectedCodeTaskId === taskId;
+    
+    // 即使不需要选中，如果当前选中的就是这个任务，也需要更新UI状态
+    const isCurrentSelectedTask = this.selectedCodeTaskId === taskId;
+    
+    if (!shouldSelect && !isCurrentSelectedTask) {
+      return;
+    }
+    const sameTask = this.selectedCodeTaskId === taskId;
+    const previousEventCount = this.codeTaskEvents.length;
+    const previousFirstSeq = this.codeTaskEvents.length > 0 ? this.codeTaskEvents[0].seq : 0;
+    const previousLastSeq = this.codeTaskEvents.length > 0 ? this.codeTaskEvents[this.codeTaskEvents.length - 1].seq : 0;
+    const previousStatus = this.selectedCodeTaskStatus;
+    const previousRunning = this.selectedCodeTaskRunning;
+    const wasAtBottom = sameTask ? this.shouldAutoFollowCodeTaskBottom() : true;
+    this.beginCodeTaskHostUpdateWindow();
+    this.selectedCodeTaskId = taskId;
+    this.selectedCodeTaskTitle = stringValue(summary.title, 'OpenCode 任务');
+    this.selectedCodeTaskStatus = stringValue(view.status, stringValue(summary.status, 'idle'));
+    this.selectedCodeTaskRunning = view.running === true;
+    this.selectedCodeTaskSummary = stringValue(view.summary, stringValue(summary.summary));
+    this.selectedCodeTaskQuestions = this.codeTaskQuestionsForDisplay(taskId, this.codeTaskQuestionsFromMobileView(view));
+    if (
+      this.selectedCodeTaskQuestions.length > 0 ||
+        this.isCodeTaskTerminalStatus(this.selectedCodeTaskStatus) ||
+        !this.selectedCodeTaskRunning
+    ) {
+      this.clearPendingCodeTaskQuestionReply(taskId);
+    }
+    const nextEvents = this.codeTaskEventsFromMobileView(view);
+    const nextFirstSeq = nextEvents.length > 0 ? nextEvents[0].seq : 0;
+    const nextLastSeq = nextEvents.length > 0 ? nextEvents[nextEvents.length - 1].seq : 0;
+    const eventsChanged = !sameTask ||
+      previousEventCount !== nextEvents.length ||
+      previousFirstSeq !== nextFirstSeq ||
+      previousLastSeq !== nextLastSeq;
+    if (eventsChanged) {
+      this.codeTaskEvents = nextEvents;
+    }
+    this.initCodeTaskQuestionDrafts();
+    this.syncCodeTaskExpandedTurns();
+    this.codeTaskConnectionMessage = this.selectedCodeTaskQuestions.length > 0 ? '主机端等待选择' : '已同步主机任务过程';
+    const materialChanged = eventsChanged ||
+      previousStatus !== this.selectedCodeTaskStatus ||
+      previousRunning !== this.selectedCodeTaskRunning;
+    if (!updateScroll || !materialChanged) {
+      return;
+    }
+    const needsSettleScroll = this.isCodeTaskTerminalStatus(this.selectedCodeTaskStatus) || !this.selectedCodeTaskRunning;
+    if (sameTask) {
+      this.preserveCodeTaskScrollAfterUpdate(wasAtBottom, needsSettleScroll);
+    } else {
+      this.scrollCodeTaskToBottom(true, needsSettleScroll);
+    }
+  }
+
+  private codeTaskMobileViewTaskId(view: CodeTaskMobileViewSnapshot): string {
+    return stringValue(view.taskId, stringValue(view.task?.id));
+  }
+
+  private isCodeTaskMobileViewDeleted(view: CodeTaskMobileViewSnapshot): boolean {
+    return stringValue(view.kind) === 'code_task_deleted' || stringValue(view.status) === 'deleted';
+  }
+
+  private removeCodeTaskMobileView(taskId: string): void {
+    if (taskId.length === 0) {
+      return;
+    }
+    this.codeTaskViewSnapshots = this.codeTaskViewSnapshots.filter((view: CodeTaskMobileViewSnapshot): boolean => {
+      return this.codeTaskMobileViewTaskId(view) !== taskId;
+    });
+    this.codeTasks = this.codeTasks.filter((task: CodeTaskSummary): boolean => task.id !== taskId);
+    if (this.selectedCodeTaskId === taskId) {
+      this.clearSelectedCodeTask();
+      const nextView = this.codeTaskViewSnapshots.length > 0 ? this.codeTaskViewSnapshots[0] : undefined;
+      if (nextView !== undefined) {
+        this.applyCodeTaskMobileView(nextView, true);
+      }
+    }
+    this.codeTaskConnectionMessage = this.codeTasks.length > 0 ? '主机端已删除任务，已同步列表' : '主机暂无 OpenCode 任务。';
+  }
+
+  private codeTaskSummaryFromMobileView(view: CodeTaskMobileViewSnapshot): CodeTaskSummary {
+    const taskId = this.codeTaskMobileViewTaskId(view);
+    const task = view.task;
+    const events = this.codeTaskEventsFromMobileView(view);
+    const lastEvent = events.length > 0 ? events[events.length - 1] : undefined;
+    const viewEventCount = view.view?.eventCount;
+    return {
+      id: taskId,
+      title: stringValue(task?.title, 'OpenCode 任务'),
+      prompt: stringValue(task?.prompt),
+      workspacePath: stringValue(task?.workspacePath),
+      status: stringValue(view.status, stringValue(task?.status, 'idle')),
+      sessionId: stringValue(task?.sessionId),
+      running: view.running,
+      backgroundRunning: view.running,
+      pendingQuestions: this.codeTaskQuestionsFromMobileView(view),
+      createdAt: stringValue(task?.createdAt, stringValue(view.renderedAt)),
+      updatedAt: stringValue(task?.updatedAt, stringValue(view.renderedAt)),
+      eventCount: viewEventCount === undefined ? events.length : viewEventCount,
+      lastEvent,
+      summary: stringValue(view.summary),
+    };
+  }
+
+  private codeTaskQuestionsFromMobileView(view: CodeTaskMobileViewSnapshot): CodeTaskQuestionPayload[] {
+    const pendingQuestion = view.pendingQuestion;
+    if (pendingQuestion === undefined || pendingQuestion === null) {
+      return [];
+    }
+    const question = this.codeTaskQuestionFromView(pendingQuestion);
+    return question.requestId === undefined || stringValue(question.requestId).length === 0 ? [] : [question];
+  }
+
+  private codeTaskQuestionFromView(question: CodeTaskViewQuestion): CodeTaskQuestionPayload {
+    return {
+      requestId: stringValue(question.requestId),
+      sessionId: stringValue(question.sessionId),
+      questions: Array.isArray(question.questions) ? question.questions : [],
+      message: '',
+      v2: question.v2 !== false,
+    };
+  }
+
+  private codeTaskEventsFromMobileView(view: CodeTaskMobileViewSnapshot): CodeTaskEventRecord[] {
+    const taskId = this.codeTaskMobileViewTaskId(view);
+    const turns = Array.isArray(view.turns) ? view.turns : [];
+    const events: CodeTaskEventRecord[] = [];
+    const seenMessages: string[] = [];
+    let seq = 1;
+    turns.forEach((turn: CodeTaskViewTurn | null | undefined): void => {
+      if (turn === undefined || turn === null) {
+        return;
+      }
+      const request = turn.request;
+      if (request !== undefined && request !== null) {
+        events.push(this.codeTaskEventFromViewMessage(taskId, request, seq, 'request'));
+        seenMessages.push(stringValue(request.id, `${seq}`));
+        seq += 1;
+      }
+      const rawPhases = turn.processed?.phases;
+      const phases = Array.isArray(rawPhases) ? rawPhases : [];
+      phases.forEach((phase: CodeTaskViewPhase | null | undefined): void => {
+        if (phase === undefined || phase === null) {
+          return;
+        }
+        const rawMessages = phase.messages;
+        const messages = Array.isArray(rawMessages) ? rawMessages : [];
+        messages.forEach((message: CodeTaskViewMessage | null | undefined): void => {
+          if (message === undefined || message === null) {
+            return;
+          }
+          const key = stringValue(message.id, `${seq}`);
+          if (seenMessages.indexOf(key) >= 0) {
+            return;
+          }
+          events.push(this.codeTaskEventFromViewMessage(taskId, message, seq, stringValue(phase.id)));
+          seenMessages.push(key);
+          seq += 1;
+        });
+      });
+      const rawResponses = turn.responses;
+      const responses = Array.isArray(rawResponses) ? rawResponses : [];
+      responses.forEach((message: CodeTaskViewMessage | null | undefined): void => {
+        if (message === undefined || message === null) {
+          return;
+        }
+        const key = stringValue(message.id, `${seq}`);
+        if (seenMessages.indexOf(key) >= 0) {
+          return;
+        }
+        events.push(this.codeTaskEventFromViewMessage(taskId, message, seq, 'result'));
+        seenMessages.push(key);
+        seq += 1;
+      });
+    });
+    return events;
+  }
+
+  private codeTaskEventFromViewMessage(
+    taskId: string,
+    message: CodeTaskViewMessage,
+    seq: number,
+    phaseId: string,
+  ): CodeTaskEventRecord {
+    const eventSeq = this.codeTaskViewMessageSeq(message, seq);
+    const eventName = this.codeTaskViewMessageEventName(message, phaseId);
+    const createdAt = stringValue(message.createdAt, new Date().toISOString());
+    const text = stringValue(message.text, stringValue(message.detail, stringValue(message.title)));
+    const payload: CodeTaskEventPayload = {
+      taskId,
+      eventId: eventSeq,
+      emittedAt: createdAt,
+      title: stringValue(message.title),
+      text,
+      message: text,
+      detail: stringValue(message.detail),
+      status: eventName === 'status' || eventName === 'done' ? text : undefined,
+      source: eventName === 'input' ? 'mobile' : 'host-view',
+    };
+    const question = message.question;
+    if (eventName === 'question' && question !== undefined && question !== null) {
+      payload.requestId = stringValue(question.requestId);
+      payload.sessionId = stringValue(question.sessionId);
+      payload.questions = Array.isArray(question.questions) ? question.questions : [];
+      payload.v2 = question.v2 !== false;
+      payload.answers = question.answers;
+      payload.rejected = question.rejected;
+    }
+    if (eventName === 'tool') {
+      payload.name = stringValue(message.title, 'tool');
+    }
+    if (eventName === 'command') {
+      payload.command = stringValue(message.title, text);
+      payload.output = stringValue(message.detail);
+    }
+    if (eventName === 'file') {
+      payload.path = text;
+    }
+    if (eventName === 'diff') {
+      payload.diff = stringValue(message.detail, text);
+    }
+    return {
+      seq: eventSeq,
+      event: eventName,
+      payload,
+      createdAt,
+    };
+  }
+
+  private codeTaskViewMessageSeq(message: CodeTaskViewMessage, fallback: number): number {
+    const rawId = stringValue(message.id);
+    if (rawId.length > 0) {
+      const parts = rawId.split('-');
+      for (let index = parts.length - 2; index >= 0; index -= 1) {
+        const value = Number(parts[index]);
+        if (Number.isFinite(value) && value > 0) {
+          return value;
+        }
+      }
+    }
+    return fallback;
+  }
+
+  private codeTaskViewMessageEventName(message: CodeTaskViewMessage, phaseId: string): string {
+    const kind = stringValue(message.kind);
+    const title = stringValue(message.title).toLowerCase();
+    if (kind === 'user') {
+      return 'input';
+    }
+    if (kind === 'assistant') {
+      return 'output';
+    }
+    if (kind === 'done') {
+      return 'done';
+    }
+    if (kind === 'error') {
+      return 'error';
+    }
+    if (kind === 'question') {
+      return 'question';
+    }
+    if (kind === 'command') {
+      return 'command';
+    }
+    if (kind === 'tool') {
+      return 'tool';
+    }
+    if (kind === 'permission') {
+      return 'permission';
+    }
+    if (kind === 'file' && (title === 'diff' || phaseId === 'files' && title.indexOf('diff') >= 0)) {
+      return 'diff';
+    }
+    if (kind === 'file') {
+      return 'file';
+    }
+    if (kind === 'status') {
+      return 'status';
+    }
+    return 'log';
   }
 
   private clearSelectedCodeTask(): void {
@@ -4408,8 +4924,18 @@ struct Index {
       this.scheduleCodeTaskReopenRefresh(taskId, CODE_TASK_REOPEN_REFRESH_RETRY_MS, true);
       return;
     }
+    if (
+      this.hasLocalCodeTaskProcessing() &&
+      !detailRunning &&
+      !this.codeTaskDetailHasCurrentLocalInput(detail) &&
+      !this.codeTaskDetailHasNewHostEventsAfterLocalInput(detail) &&
+      !this.codeTaskDetailUpdatedAfterLocalInput(detail)
+    ) {
+      this.scheduleCodeTaskReopenRefresh(taskId, CODE_TASK_REOPEN_REFRESH_RETRY_MS, false);
+      return;
+    }
     this.applyCodeTaskDetail(this.codeTaskDetailForDisplay(detail), true);
-    if (displayPendingQuestions.length > 0 || this.isCodeTaskTerminalStatus(detailStatus)) {
+    if (displayPendingQuestions.length > 0 || this.isCodeTaskTerminalStatus(detailStatus) || !this.isCodeTaskTaskRunning(detail.running, detailStatus, detail.backgroundRunning)) {
       this.clearPendingCodeTaskQuestionReply(taskId);
     }
     this.codeTaskConnectionMessage = displayPendingQuestions.length > 0 ? '主机端等待选择' : '已同步任务结果';
@@ -4778,7 +5304,15 @@ struct Index {
 
   private isCodeTaskTaskRunning(running: boolean | undefined, status: string, backgroundRunning: boolean | undefined = false): boolean {
     if (running === true || backgroundRunning === true) {
-      return !this.isCodeTaskErrorStatus(status);
+      const normalized = status.toLowerCase();
+      const isRealTerminal = (normalized === 'done' || normalized === 'completed' || normalized === 'complete' ||
+        normalized === 'finished' || normalized === 'success' || normalized === 'succeeded' ||
+        normalized === 'stopped' || normalized === 'cancelled' || normalized === 'canceled' ||
+        this.isCodeTaskErrorStatus(status));
+      if (isRealTerminal) {
+        return false;
+      }
+      return true;
     }
     if (this.isCodeTaskTerminalStatus(status)) {
       return false;
@@ -5121,13 +5655,20 @@ struct Index {
     this.codeTasks = next;
   }
 
-  private normalizedCodeTaskQuestions(questions: CodeTaskQuestionPayload[] | undefined): CodeTaskQuestionPayload[] {
-    return Array.isArray(questions) ? questions : [];
+  private normalizedCodeTaskQuestions(
+    questions: (CodeTaskQuestionPayload | null)[] | null | undefined,
+  ): CodeTaskQuestionPayload[] {
+    if (!Array.isArray(questions)) {
+      return [];
+    }
+    return questions.filter((question: CodeTaskQuestionPayload | null | undefined): boolean => {
+      return question !== undefined && question !== null && stringValue(question.requestId).length > 0;
+    }) as CodeTaskQuestionPayload[];
   }
 
   private codeTaskQuestionsForDisplay(
     taskId: string,
-    questions: CodeTaskQuestionPayload[] | undefined,
+    questions: (CodeTaskQuestionPayload | null)[] | null | undefined,
   ): CodeTaskQuestionPayload[] {
     const normalized = this.normalizedCodeTaskQuestions(questions);
     if (!this.hasPendingCodeTaskQuestionReply(taskId)) {
@@ -5307,7 +5848,7 @@ struct Index {
       return;
     }
     this.applyCodeTaskDetail(detail, true);
-    if (pendingQuestions.length > 0 || this.isCodeTaskTerminalStatus(detailStatus)) {
+    if (pendingQuestions.length > 0 || this.isCodeTaskTerminalStatus(detailStatus) || !this.isCodeTaskTaskRunning(detail.running, detailStatus, detail.backgroundRunning)) {
       this.clearPendingCodeTaskQuestionReply(taskId);
     }
     this.codeTaskConnectionMessage = pendingQuestions.length > 0 ? '主机端等待选择' : '已同步任务结果';
@@ -5351,7 +5892,7 @@ struct Index {
         return;
       }
       this.applyCodeTaskDetail(detail, true);
-      if (pendingQuestions.length > 0 || this.isCodeTaskTerminalStatus(detailStatus)) {
+      if (pendingQuestions.length > 0 || this.isCodeTaskTerminalStatus(detailStatus) || !this.isCodeTaskTaskRunning(detail.running, detailStatus, detail.backgroundRunning)) {
         this.clearPendingCodeTaskQuestionReply(taskId);
       }
       this.codeTaskConnectionMessage = pendingQuestions.length > 0 ? '主机端等待选择' : '已同步任务结果';
@@ -5479,6 +6020,16 @@ struct Index {
     });
   }
 
+  private codeTaskBridgeForCommand(): CodeTaskBridgeStream | undefined {
+    if (!CodeTaskRemoteService.isConfigured(this.hostAgentSettings)) {
+      throw new Error('请先配置远程主机。');
+    }
+    if (this.codeTaskBridge === undefined) {
+      this.connectCodeTaskBridge();
+    }
+    return this.codeTaskBridge;
+  }
+
   private async replyCodeTaskQuestion(question: CodeTaskQuestionPayload): Promise<void> {
     if (this.codeTaskReplying) {
       return;
@@ -5493,23 +6044,40 @@ struct Index {
       this.showToast('请先完成选择或自定义回答');
       return;
     }
-    const afterSeq = this.lastHostCodeTaskEventSeq();
     this.codeTaskReplying = true;
     this.beginLocalCodeTaskQuestionReplyProcessing(taskId, requestId, answers, false);
+    this.selectedCodeTaskQuestions = this.codeTaskQuestionsForDisplay(taskId, this.selectedCodeTaskQuestions);
+    this.initCodeTaskQuestionDrafts();
     try {
-      const result = await CodeTaskRemoteService.replyQuestion(
-        this.hostAgentSettings,
-        taskId,
-        requestId,
-        answers,
-        question.v2 !== false,
-        false,
-        true,
-        afterSeq,
-        180,
-      );
+      const bridge = this.codeTaskBridgeForCommand();
+      let result: CodeTaskQuestionReplyResult;
+      try {
+        if (bridge === undefined) {
+          throw new Error('主机 bridge 未连接。');
+        }
+        result = await bridge.replyQuestion(
+          taskId,
+          requestId,
+          answers,
+          question.v2 !== false,
+          false,
+        );
+      } catch (bridgeError) {
+        this.codeTaskConnectionMessage = `bridge 发送失败，改用 HTTP 提交：${errorToString(bridgeError).substring(0, 48)}`;
+        result = await CodeTaskRemoteService.replyBridgeQuestion(
+          this.hostAgentSettings,
+          taskId,
+          requestId,
+          answers,
+          question.v2 !== false,
+          false,
+        );
+      }
+      if (result.ok === false) {
+        throw new Error(stringValue(result.error, '主机端拒绝了选择提交。'));
+      }
+      this.codeTaskConnectionMessage = '已提交选择，等待主机端推送结果';
       this.showToast('已提交选择');
-      this.applyCodeTaskQuestionReplyResult(taskId, requestId, result, afterSeq);
     } catch (error) {
       this.cancelLocalCodeTaskQuestionReplyProcessing(taskId, requestId, question);
       this.showToast(`提交失败：${errorToString(error).substring(0, 48)}`);
@@ -5527,23 +6095,40 @@ struct Index {
       return;
     }
     const taskId = this.selectedCodeTaskId;
-    const afterSeq = this.lastHostCodeTaskEventSeq();
     this.codeTaskReplying = true;
     this.beginLocalCodeTaskQuestionReplyProcessing(taskId, requestId, [], true);
+    this.selectedCodeTaskQuestions = this.codeTaskQuestionsForDisplay(taskId, this.selectedCodeTaskQuestions);
+    this.initCodeTaskQuestionDrafts();
     try {
-      const result = await CodeTaskRemoteService.replyQuestion(
-        this.hostAgentSettings,
-        taskId,
-        requestId,
-        [],
-        question.v2 !== false,
-        true,
-        true,
-        afterSeq,
-        180,
-      );
+      const bridge = this.codeTaskBridgeForCommand();
+      let result: CodeTaskQuestionReplyResult;
+      try {
+        if (bridge === undefined) {
+          throw new Error('主机 bridge 未连接。');
+        }
+        result = await bridge.replyQuestion(
+          taskId,
+          requestId,
+          [],
+          question.v2 !== false,
+          true,
+        );
+      } catch (bridgeError) {
+        this.codeTaskConnectionMessage = `bridge 发送失败，改用 HTTP 提交：${errorToString(bridgeError).substring(0, 48)}`;
+        result = await CodeTaskRemoteService.replyBridgeQuestion(
+          this.hostAgentSettings,
+          taskId,
+          requestId,
+          [],
+          question.v2 !== false,
+          true,
+        );
+      }
+      if (result.ok === false) {
+        throw new Error(stringValue(result.error, '主机端拒绝了选择提交。'));
+      }
+      this.codeTaskConnectionMessage = '已拒绝选择，等待主机端推送结果';
       this.showToast('已拒绝');
-      this.applyCodeTaskQuestionReplyResult(taskId, requestId, result, afterSeq);
     } catch (error) {
       this.cancelLocalCodeTaskQuestionReplyProcessing(taskId, requestId, question);
       this.showToast(`拒绝失败：${errorToString(error).substring(0, 48)}`);
@@ -5553,7 +6138,9 @@ struct Index {
   }
 
   private canSendCodeTaskMessage(): boolean {
-    return this.selectedCodeTaskId.length > 0 && !this.codeTaskSending && this.codeTaskMessageDraft.trim().length > 0;
+    return CodeTaskRemoteService.isConfigured(this.hostAgentSettings) &&
+      !this.codeTaskSending &&
+      this.codeTaskMessageDraft.trim().length > 0;
   }
 
   private async sendCodeTaskMessage(): Promise<void> {
@@ -5561,25 +6148,97 @@ struct Index {
       return;
     }
     const prompt = this.codeTaskMessageDraft.trim();
-    const taskId = this.selectedCodeTaskId;
+    let taskId = this.selectedCodeTaskId;
+    const isNewTask = taskId.length === 0;
+    const title = isNewTask ? this.codeTaskCompactTitle(prompt) :
+      (this.selectedCodeTaskTitle.length > 0 ? this.selectedCodeTaskTitle : this.codeTaskCompactTitle(prompt));
     this.codeTaskSending = true;
     this.codeTaskMessageDraft = '';
+    if (isNewTask) {
+      taskId = createId('code-task');
+      const createdAt = new Date().toISOString();
+      this.selectedCodeTaskId = taskId;
+      this.selectedCodeTaskTitle = title;
+      this.selectedCodeTaskStatus = 'running';
+      this.selectedCodeTaskRunning = true;
+      this.selectedCodeTaskSummary = '';
+      this.selectedCodeTaskQuestions = [];
+      this.codeTaskQuestionDrafts = [];
+      this.codeTaskEvents = [];
+      this.codeTaskExpandedTurnIds = [];
+      this.codeTaskDetachedFromBottom = false;
+      this.clearPendingCodeTaskQuestionReply();
+      this.upsertCodeTaskSummary({
+        id: taskId,
+        title,
+        prompt,
+        status: 'running',
+        running: true,
+        backgroundRunning: true,
+        createdAt,
+        updatedAt: createdAt,
+        eventCount: 0,
+      });
+    } else if (this.selectedCodeTaskTitle.length === 0) {
+      this.selectedCodeTaskTitle = title;
+    }
     this.beginLocalCodeTaskProcessing(taskId, prompt);
     try {
-      const result = await CodeTaskRemoteService.sendMessage(
-        this.hostAgentSettings,
-        taskId,
-        prompt,
-        this.selectedCodeTaskTitle,
-      );
-      this.codeTaskConnectionMessage = stringValue(result.summary, '已发送任务推进消息');
-      this.showToast('已发送，主机端处理中');
-      this.scheduleCodeTaskReopenRefresh(taskId, CODE_TASK_REOPEN_REFRESH_DELAY_MS, false);
+      const bridge = this.codeTaskBridgeForCommand();
+      const workspacePath = this.currentCodeTaskWorkspacePath();
+      let result: CodeTaskMessageResult;
+      try {
+        if (bridge === undefined) {
+          throw new Error('主机 bridge 未连接。');
+        }
+        result = await bridge.sendTask(
+          taskId,
+          prompt,
+          title,
+          workspacePath,
+        );
+      } catch (bridgeError) {
+        this.codeTaskConnectionMessage = `bridge 发送失败，改用 HTTP 提交：${errorToString(bridgeError).substring(0, 48)}`;
+        result = await CodeTaskRemoteService.sendBridgeTask(
+          this.hostAgentSettings,
+          taskId,
+          prompt,
+          title,
+          workspacePath,
+        );
+      }
+      if (result.ok === false) {
+        throw new Error(stringValue(result.error, '主机端拒绝了任务提交。'));
+      }
+      this.codeTaskConnectionMessage = stringValue(result.summary, '已发送，等待主机端推送任务过程');
+      this.showToast('已发送到主机端');
     } catch (error) {
       if (this.selectedCodeTaskId === taskId && this.codeTaskMessageDraft.length === 0) {
         this.codeTaskMessageDraft = prompt;
       }
       this.cancelLocalCodeTaskProcessing(taskId, prompt);
+      this.selectedCodeTaskRunning = false;
+      this.selectedCodeTaskStatus = 'error';
+      const failedTask = this.codeTasks.find((task: CodeTaskSummary): boolean => task.id === taskId);
+      if (failedTask !== undefined) {
+        this.upsertCodeTaskSummary({
+          id: failedTask.id,
+          title: failedTask.title,
+          prompt: failedTask.prompt,
+          workspacePath: failedTask.workspacePath,
+          status: 'error',
+          sessionId: failedTask.sessionId,
+          serverUrl: failedTask.serverUrl,
+          running: false,
+          backgroundRunning: false,
+          pendingQuestions: failedTask.pendingQuestions,
+          createdAt: failedTask.createdAt,
+          updatedAt: new Date().toISOString(),
+          eventCount: this.codeTaskEvents.length,
+          lastEvent: failedTask.lastEvent,
+          summary: failedTask.summary,
+        });
+      }
       this.codeTaskConnectionMessage = `发送失败：${errorToString(error).substring(0, 80)}`;
       this.showToast(`发送失败：${errorToString(error).substring(0, 48)}`);
     } finally {
@@ -5890,6 +6549,7 @@ struct Index {
     await ChatPersistence.saveHostAgentSettings(context, nextHostAgent);
     await ChatPersistence.saveChatMode(context, this.selectedMode);
     this.settingsVisible = false;
+    this.disconnectCodeTaskBridge();
     if (this.codeTaskProgress > 0 && CodeTaskRemoteService.isConfigured(nextHostAgent)) {
       this.refreshCodeTasks();
     }
@@ -7525,7 +8185,7 @@ struct Index {
   }
 
   private updateCodeTaskBottomButton(): void {
-    if (this.codeTaskAutoScrolling) {
+    if (this.codeTaskAutoScrolling || this.codeTaskApplyingHostUpdate) {
       return;
     }
     this.codeTaskDetachedFromBottom = !this.isCodeTaskAtBottom();
@@ -7544,39 +8204,74 @@ struct Index {
   }
 
   private shouldAutoFollowCodeTaskBottom(): boolean {
-    if (this.codeTaskDetachedFromBottom) {
-      return false;
-    }
-    return this.isCodeTaskAtBottom();
+    return !this.codeTaskDetachedFromBottom;
   }
 
-  private preserveCodeTaskScrollAfterUpdate(wasAtBottom: boolean): void {
+  private preserveCodeTaskScrollAfterUpdate(wasAtBottom: boolean, settle: boolean = false): void {
     if (wasAtBottom) {
-      this.scrollCodeTaskToBottom(true);
+      this.scrollCodeTaskToBottom(true, settle);
       return;
     }
     this.codeTaskDetachedFromBottom = true;
   }
 
   private returnCodeTaskToBottom(): void {
-    this.scrollCodeTaskToBottom(true);
+    this.scrollCodeTaskToBottom(true, true);
   }
 
-  private scrollCodeTaskToBottom(force: boolean = false): void {
+  private clearCodeTaskScrollTimers(): void {
+    if (this.codeTaskScrollTimer >= 0) {
+      clearTimeout(this.codeTaskScrollTimer);
+      this.codeTaskScrollTimer = -1;
+    }
+    if (this.codeTaskScrollSettleTimer >= 0) {
+      clearTimeout(this.codeTaskScrollSettleTimer);
+      this.codeTaskScrollSettleTimer = -1;
+    }
+    if (this.codeTaskHostUpdateTimer >= 0) {
+      clearTimeout(this.codeTaskHostUpdateTimer);
+      this.codeTaskHostUpdateTimer = -1;
+    }
+    this.codeTaskApplyingHostUpdate = false;
+  }
+
+  private beginCodeTaskHostUpdateWindow(): void {
+    this.codeTaskApplyingHostUpdate = true;
+    if (this.codeTaskHostUpdateTimer >= 0) {
+      clearTimeout(this.codeTaskHostUpdateTimer);
+    }
+    this.codeTaskHostUpdateTimer = setTimeout(() => {
+      this.codeTaskHostUpdateTimer = -1;
+      this.codeTaskApplyingHostUpdate = false;
+    }, 220);
+  }
+
+  private scrollCodeTaskToBottom(force: boolean = false, settle: boolean = false): void {
     if (this.codeTaskDetachedFromBottom && !force) {
       return;
     }
+    this.clearCodeTaskScrollTimers();
     this.codeTaskAutoScrolling = true;
     this.codeTaskDetachedFromBottom = false;
-    setTimeout(() => {
+    this.codeTaskScrollTimer = setTimeout(() => {
+      this.codeTaskScrollTimer = -1;
       try {
         this.codeTaskScroller.scrollEdge(Edge.Bottom);
       } catch (_) {
       }
-    }, 30);
+    }, 80);
+    if (settle) {
+      this.codeTaskScrollSettleTimer = setTimeout(() => {
+        this.codeTaskScrollSettleTimer = -1;
+        try {
+          this.codeTaskScroller.scrollEdge(Edge.Bottom);
+        } catch (_) {
+        }
+      }, 360);
+    }
     setTimeout(() => {
       this.codeTaskAutoScrolling = false;
       this.codeTaskDetachedFromBottom = !this.isCodeTaskAtBottom();
-    }, 260);
+    }, settle ? 620 : 320);
   }
 }

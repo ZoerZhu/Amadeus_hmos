@@ -3,6 +3,10 @@ import { util } from '@kit.ArkTS';
 import { HostAgentSettings } from '../model/AppModels';
 
 const MOBILE_TASKS_PATH = '/api/mobile/code-tasks';
+const MOBILE_BRIDGE_WS_PATH = '/api/mobile/bridge/ws';
+const MOBILE_BRIDGE_TASK_PATH = '/api/mobile/bridge/task';
+const MOBILE_BRIDGE_QUESTION_REPLY_PATH = '/api/mobile/bridge/question/reply';
+const MOBILE_TASK_VIEWS_PATH = '/api/mobile/task-views';
 const MOBILE_TASK_CONNECT_TIMEOUT_MS = 20000;
 const MOBILE_TASK_WS_READY_TIMEOUT_MS = 5000;
 const MOBILE_TASK_REQUEST_READ_TIMEOUT_MS = 20000;
@@ -92,6 +96,82 @@ export interface CodeTaskSnapshot {
   updatedAt?: string;
 }
 
+export interface CodeTaskViewQuestion {
+  requestId?: string;
+  sessionId?: string;
+  serverUrl?: string;
+  questions?: CodeTaskQuestionItem[];
+  v2?: boolean;
+  answered?: boolean;
+  rejected?: boolean;
+  answers?: string[][];
+}
+
+export interface CodeTaskViewMessage {
+  id?: string;
+  kind?: string;
+  title?: string;
+  text?: string;
+  detail?: string;
+  createdAt?: string;
+  question?: CodeTaskViewQuestion | null;
+}
+
+export interface CodeTaskViewPhase {
+  id?: string;
+  title?: string;
+  status?: string;
+  eventCount?: number;
+  hiddenCount?: number;
+  messages?: (CodeTaskViewMessage | null)[];
+}
+
+export interface CodeTaskViewProcessed {
+  title?: string;
+  openByDefault?: boolean;
+  duration?: string;
+  phaseCount?: number;
+  eventCount?: number;
+  phases?: (CodeTaskViewPhase | null)[] | null;
+}
+
+export interface CodeTaskViewTurn {
+  id?: string;
+  running?: boolean;
+  request?: CodeTaskViewMessage | null;
+  processed?: CodeTaskViewProcessed | null;
+  responses?: (CodeTaskViewMessage | null)[] | null;
+}
+
+export interface CodeTaskMobileViewSnapshot {
+  version?: number;
+  kind?: string;
+  taskId?: string;
+  status?: string;
+  running?: boolean;
+  renderedAt?: string;
+  task?: CodeTaskSnapshot | null;
+  view?: CodeTaskMobileViewMeta | null;
+  turns?: (CodeTaskViewTurn | null)[] | null;
+  pendingQuestion?: CodeTaskViewQuestion | null;
+  summary?: string;
+}
+
+export interface CodeTaskMobileViewMeta {
+  source?: string;
+  refreshIntervalMs?: number;
+  eventCount?: number;
+  turnCount?: number;
+}
+
+export interface CodeTaskViewRecord {
+  type?: string;
+  seq?: number;
+  taskId?: string;
+  snapshot?: CodeTaskMobileViewSnapshot;
+  createdAt?: string;
+}
+
 export interface CodeTaskSummary {
   id: string;
   title?: string;
@@ -102,7 +182,7 @@ export interface CodeTaskSummary {
   serverUrl?: string;
   running?: boolean;
   backgroundRunning?: boolean;
-  pendingQuestions?: CodeTaskQuestionPayload[];
+  pendingQuestions?: (CodeTaskQuestionPayload | null)[];
   createdAt?: string;
   updatedAt?: string;
   eventCount?: number;
@@ -143,9 +223,36 @@ export interface CodeTaskEventStream {
   ): Promise<CodeTaskQuestionReplyResult>;
 }
 
+export interface CodeTaskBridgeStream {
+  close(): void;
+  sendTask(
+    taskId: string,
+    prompt: string,
+    title: string,
+    workspacePath?: string,
+  ): Promise<CodeTaskMessageResult>;
+  replyQuestion(
+    taskId: string,
+    requestId: string,
+    answers: string[][],
+    v2: boolean,
+    reject?: boolean,
+  ): Promise<CodeTaskQuestionReplyResult>;
+  ping(): Promise<CodeTaskMessageResult>;
+}
+
 export interface CodeTaskEventStreamCallbacks {
   onTask?: (task: CodeTaskDetail) => void;
   onEvent: (event: CodeTaskEventRecord) => void;
+  onError: (message: string) => void;
+  onDone?: () => void;
+}
+
+export interface CodeTaskBridgeCallbacks {
+  onOpen?: () => void;
+  onHello?: (message: string) => void;
+  onView: (view: CodeTaskMobileViewSnapshot, seq: number) => void;
+  onAck?: (action: string, result: CodeTaskMessageResult | CodeTaskQuestionReplyResult) => void;
   onError: (message: string) => void;
   onDone?: () => void;
 }
@@ -173,6 +280,10 @@ interface CodeTaskDetailResponse {
 interface CodeTaskWaitResponse {
   task?: CodeTaskDetail;
   timedOut?: boolean;
+}
+
+interface CodeTaskViewsResponse {
+  views?: CodeTaskViewRecord[];
 }
 
 interface CodeTaskHttpHeaderMap {
@@ -216,6 +327,32 @@ interface CodeTaskWsQuestionReplyCommand {
   reject: boolean;
 }
 
+interface CodeTaskBridgeTaskCommand {
+  type: string;
+  clientRequestId: string;
+  taskId: string;
+  prompt: string;
+  title: string;
+  workspacePath: string;
+  autoApprove: boolean;
+  timeoutSeconds: number;
+}
+
+interface CodeTaskBridgeQuestionReplyCommand {
+  type: string;
+  clientRequestId: string;
+  taskId: string;
+  requestId: string;
+  answers: string[][];
+  v2: boolean;
+  reject: boolean;
+}
+
+interface CodeTaskBridgePingCommand {
+  type: string;
+  clientRequestId: string;
+}
+
 interface SseTaskEnvelope {
   task?: CodeTaskDetail;
 }
@@ -232,6 +369,19 @@ interface WebSocketTaskEnvelope {
   message?: string;
 }
 
+interface WebSocketBridgeEnvelope {
+  type?: string;
+  action?: string;
+  protocolVersion?: number;
+  event?: string;
+  seq?: number;
+  taskId?: string;
+  snapshot?: CodeTaskMobileViewSnapshot;
+  result?: CodeTaskMessageResult | CodeTaskQuestionReplyResult;
+  message?: string;
+  clientRequestId?: string;
+}
+
 export class CodeTaskRemoteService {
   static isConfigured(settings: HostAgentSettings): boolean {
     return settings.enabled && settings.baseUrl.trim().length > 0;
@@ -241,6 +391,12 @@ export class CodeTaskRemoteService {
     const response = await requestJson(settings, cacheBustedPath(MOBILE_TASKS_PATH), http.RequestMethod.GET);
     const payload = parseJson<CodeTaskListResponse>(response);
     return Array.isArray(payload.tasks) ? payload.tasks : [];
+  }
+
+  static async listTaskViews(settings: HostAgentSettings): Promise<CodeTaskViewRecord[]> {
+    const response = await requestJson(settings, cacheBustedPath(MOBILE_TASK_VIEWS_PATH), http.RequestMethod.GET);
+    const payload = parseJson<CodeTaskViewsResponse>(response);
+    return Array.isArray(payload.views) ? payload.views : [];
   }
 
   static async getTaskDetail(settings: HostAgentSettings, taskId: string): Promise<CodeTaskDetail> {
@@ -324,12 +480,71 @@ export class CodeTaskRemoteService {
     return parseJson<CodeTaskQuestionReplyResult>(response);
   }
 
+  static async sendBridgeTask(
+    settings: HostAgentSettings,
+    taskId: string,
+    prompt: string,
+    title: string,
+    workspacePath: string = '',
+  ): Promise<CodeTaskMessageResult> {
+    const body: CodeTaskBridgeTaskCommand = {
+      type: 'task',
+      clientRequestId: createBridgeRequestId('task-http'),
+      taskId,
+      prompt,
+      title,
+      workspacePath,
+      autoApprove: false,
+      timeoutSeconds: 1800,
+    };
+    const response = await requestJson(
+      settings,
+      MOBILE_BRIDGE_TASK_PATH,
+      http.RequestMethod.POST,
+      body,
+    );
+    return parseJson<CodeTaskMessageResult>(response);
+  }
+
+  static async replyBridgeQuestion(
+    settings: HostAgentSettings,
+    taskId: string,
+    requestId: string,
+    answers: string[][],
+    v2: boolean,
+    reject: boolean = false,
+  ): Promise<CodeTaskQuestionReplyResult> {
+    const body: CodeTaskBridgeQuestionReplyCommand = {
+      type: 'question_reply',
+      clientRequestId: createBridgeRequestId('question-http'),
+      taskId,
+      requestId,
+      answers,
+      v2,
+      reject,
+    };
+    const response = await requestJson(
+      settings,
+      MOBILE_BRIDGE_QUESTION_REPLY_PATH,
+      http.RequestMethod.POST,
+      body,
+    );
+    return parseJson<CodeTaskQuestionReplyResult>(response);
+  }
+
   static streamTaskEvents(
     settings: HostAgentSettings,
     taskId: string,
     callbacks: CodeTaskEventStreamCallbacks,
   ): CodeTaskEventStream {
     return new WebSocketCodeTaskEventStream(settings, taskId, callbacks);
+  }
+
+  static connectBridge(
+    settings: HostAgentSettings,
+    callbacks: CodeTaskBridgeCallbacks,
+  ): CodeTaskBridgeStream {
+    return new WebSocketCodeTaskBridgeStream(settings, callbacks);
   }
 
   static streamTaskEventsByHttp(
@@ -406,7 +621,11 @@ class WebSocketCodeTaskEventStream implements CodeTaskEventStream {
         this.callbacks.onError(errorToString(error));
         return;
       }
-      this.handleMessage(data);
+      try {
+        this.handleMessage(data);
+      } catch (messageError) {
+        this.callbacks.onError(`主机任务消息处理失败：${errorToString(messageError)}`);
+      }
     });
     this.socket.on('close', (_error: Error | undefined): void => {
       if (!this.closed && this.callbacks.onDone !== undefined) {
@@ -604,6 +823,324 @@ class WebSocketCodeTaskEventStream implements CodeTaskEventStream {
   }
 }
 
+class WebSocketCodeTaskBridgeStream implements CodeTaskBridgeStream {
+  private socket: webSocket.WebSocket = webSocket.createWebSocket();
+  private callbacks: CodeTaskBridgeCallbacks;
+  private ready: Promise<void>;
+  private readyResolve?: () => void;
+  private readyReject?: (reason: Error) => void;
+  private readySettled: boolean = false;
+  private closed: boolean = false;
+  private pendingAction: string = '';
+  private pendingClientRequestId: string = '';
+  private pendingResolve?: (value: CodeTaskMessageResult | CodeTaskQuestionReplyResult) => void;
+  private pendingReject?: (reason: Error) => void;
+  private pendingTimer: number = -1;
+
+  constructor(settings: HostAgentSettings, callbacks: CodeTaskBridgeCallbacks) {
+    this.callbacks = callbacks;
+    const endpoint = `${resolveWebSocketBaseUrl(settings)}${MOBILE_BRIDGE_WS_PATH}`;
+    this.ready = new Promise<void>((resolve: () => void, reject: (reason: Error) => void): void => {
+      this.readyResolve = resolve;
+      this.readyReject = reject;
+    });
+    this.socket.on('open', (error: Error | undefined): void => {
+      if (error !== undefined) {
+        this.callbacks.onError(errorToString(error));
+        this.rejectReady(errorToString(error));
+        return;
+      }
+      this.markReady();
+      if (this.callbacks.onOpen !== undefined) {
+        this.callbacks.onOpen();
+      }
+    });
+    this.socket.on('message', (error: Error | undefined, data: string | ArrayBuffer): void => {
+      if (error !== undefined) {
+        this.callbacks.onError(errorToString(error));
+        return;
+      }
+      try {
+        this.handleMessage(data);
+      } catch (messageError) {
+        this.callbacks.onError(`主机 bridge 消息处理失败：${errorToString(messageError)}`);
+      }
+    });
+    this.socket.on('close', (_error: Error | undefined): void => {
+      if (!this.closed && this.callbacks.onDone !== undefined) {
+        this.callbacks.onDone();
+      }
+    });
+    this.socket.on('error', (error: Error): void => {
+      if (!this.closed) {
+        this.callbacks.onError(errorToString(error));
+      }
+      this.rejectReady(errorToString(error));
+      this.rejectPending(errorToString(error));
+    });
+    this.socket.connect(endpoint, {
+      header: createHeaders(settings, 'application/json'),
+      pingInterval: 25,
+      pongTimeout: 20,
+    }).catch((error: Error | Object | string): void => {
+      const message = errorToString(error);
+      this.callbacks.onError(`主机 bridge 连接失败：${message}`);
+      this.rejectReady(message);
+      this.rejectPending(message);
+    });
+  }
+
+  close(): void {
+    this.closed = true;
+    this.rejectReady('主机 bridge 已关闭。');
+    this.rejectPending('主机 bridge 已关闭。');
+    try {
+      this.socket.off('open');
+      this.socket.off('message');
+      this.socket.off('close');
+      this.socket.off('error');
+      this.socket.close();
+    } catch (_) {
+    }
+  }
+
+  async sendTask(
+    taskId: string,
+    prompt: string,
+    title: string,
+    workspacePath: string = '',
+  ): Promise<CodeTaskMessageResult> {
+    const clientRequestId = createBridgeRequestId('task');
+    const body: CodeTaskBridgeTaskCommand = {
+      type: 'task',
+      clientRequestId,
+      taskId,
+      prompt,
+      title,
+      workspacePath,
+      autoApprove: false,
+      timeoutSeconds: 1800,
+    };
+    const result = await this.sendCommand('task', clientRequestId, body);
+    return result as CodeTaskMessageResult;
+  }
+
+  async replyQuestion(
+    taskId: string,
+    requestId: string,
+    answers: string[][],
+    v2: boolean,
+    reject: boolean = false,
+  ): Promise<CodeTaskQuestionReplyResult> {
+    const clientRequestId = createBridgeRequestId('question');
+    const body: CodeTaskBridgeQuestionReplyCommand = {
+      type: 'question_reply',
+      clientRequestId,
+      taskId,
+      requestId,
+      answers,
+      v2,
+      reject,
+    };
+    const result = await this.sendCommand('question_reply', clientRequestId, body);
+    return result as CodeTaskQuestionReplyResult;
+  }
+
+  async ping(): Promise<CodeTaskMessageResult> {
+    const clientRequestId = createBridgeRequestId('ping');
+    const body: CodeTaskBridgePingCommand = {
+      type: 'ping',
+      clientRequestId,
+    };
+    const result = await this.sendCommand('ping', clientRequestId, body);
+    return result as CodeTaskMessageResult;
+  }
+
+  private async sendCommand(
+    action: string,
+    clientRequestId: string,
+    body: CodeTaskBridgeTaskCommand | CodeTaskBridgeQuestionReplyCommand | CodeTaskBridgePingCommand,
+  ): Promise<CodeTaskMessageResult | CodeTaskQuestionReplyResult> {
+    if (this.closed) {
+      throw new Error('主机 bridge 已关闭。');
+    }
+    if (this.pendingAction.length > 0) {
+      throw new Error('已有主机指令正在提交。');
+    }
+    await this.waitReady();
+    return new Promise<CodeTaskMessageResult | CodeTaskQuestionReplyResult>((
+      resolve: (value: CodeTaskMessageResult | CodeTaskQuestionReplyResult) => void,
+      reject: (reason: Error) => void,
+    ): void => {
+      this.pendingAction = action;
+      this.pendingClientRequestId = clientRequestId;
+      this.pendingResolve = resolve;
+      this.pendingReject = reject;
+      this.pendingTimer = setTimeout((): void => {
+        this.rejectPending('主机端未确认 bridge 指令。');
+      }, MOBILE_TASK_CONNECT_TIMEOUT_MS);
+      this.socket.send(JSON.stringify(body)).catch((error: Error | Object | string): void => {
+        this.rejectPending(errorToString(error));
+      });
+    });
+  }
+
+  private async waitReady(): Promise<void> {
+    return new Promise<void>((resolve: () => void, reject: (reason: Error) => void): void => {
+      let settled = false;
+      const timer = setTimeout((): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(new Error('主机 bridge 连接超时。'));
+      }, MOBILE_TASK_WS_READY_TIMEOUT_MS);
+      this.ready.then((): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      }).catch((error: Error | Object | string): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(errorToString(error)));
+      });
+    });
+  }
+
+  private handleMessage(data: string | ArrayBuffer): void {
+    if (this.closed) {
+      return;
+    }
+    const text = responseBodyToString(data, data instanceof ArrayBuffer ? http.HttpDataType.ARRAY_BUFFER : http.HttpDataType.STRING);
+    if (text.length === 0) {
+      return;
+    }
+    let envelope: WebSocketBridgeEnvelope;
+    try {
+      envelope = parseJson<WebSocketBridgeEnvelope>(text);
+    } catch (error) {
+      this.callbacks.onError(`主机 bridge 解析失败：${errorToString(error)}`);
+      return;
+    }
+    if (envelope.type === 'hello') {
+      this.markReady();
+      if (this.callbacks.onHello !== undefined) {
+        this.callbacks.onHello(stringValue(envelope.message, '已连接主机 bridge。'));
+      }
+      return;
+    }
+    if (envelope.type === 'task_view' && envelope.snapshot !== undefined) {
+      this.markReady();
+      try {
+        this.callbacks.onView(envelope.snapshot, numberValue(envelope.seq, Date.now()));
+      } catch (error) {
+        this.callbacks.onError(`主机任务视图应用失败：${errorToString(error)}`);
+      }
+      return;
+    }
+    if (envelope.type === 'ack') {
+      this.markReady();
+      const emptyResult: CodeTaskMessageResult = {};
+      const result = envelope.result === undefined ? emptyResult : envelope.result;
+      if (this.callbacks.onAck !== undefined) {
+        this.callbacks.onAck(stringValue(envelope.action), result);
+      }
+      this.resolvePending(stringValue(envelope.action), stringValue(envelope.clientRequestId), result);
+      return;
+    }
+    if (envelope.type === 'pong') {
+      this.markReady();
+      const result: CodeTaskMessageResult = {
+        ok: true,
+        summary: 'pong',
+      };
+      this.resolvePending('ping', stringValue(envelope.clientRequestId), result);
+      return;
+    }
+    if (envelope.type === 'error') {
+      this.markReady();
+      const message = stringValue(envelope.message, '主机 bridge 返回错误。');
+      this.callbacks.onError(message);
+      this.rejectPending(message);
+    }
+  }
+
+  private markReady(): void {
+    if (this.readySettled) {
+      return;
+    }
+    this.readySettled = true;
+    const resolve = this.readyResolve;
+    this.readyResolve = undefined;
+    this.readyReject = undefined;
+    if (resolve !== undefined) {
+      resolve();
+    }
+  }
+
+  private rejectReady(message: string): void {
+    if (this.readySettled) {
+      return;
+    }
+    this.readySettled = true;
+    const reject = this.readyReject;
+    this.readyResolve = undefined;
+    this.readyReject = undefined;
+    if (reject !== undefined) {
+      reject(new Error(message));
+    }
+  }
+
+  private resolvePending(
+    action: string,
+    clientRequestId: string,
+    result: CodeTaskMessageResult | CodeTaskQuestionReplyResult,
+  ): void {
+    if (this.pendingAction.length === 0) {
+      return;
+    }
+    if (action !== this.pendingAction) {
+      return;
+    }
+    if (this.pendingClientRequestId.length > 0 && clientRequestId.length > 0 && clientRequestId !== this.pendingClientRequestId) {
+      return;
+    }
+    const resolve = this.pendingResolve;
+    this.clearPending();
+    if (resolve !== undefined) {
+      resolve(result);
+    }
+  }
+
+  private rejectPending(message: string): void {
+    if (this.pendingAction.length === 0) {
+      return;
+    }
+    const reject = this.pendingReject;
+    this.clearPending();
+    if (reject !== undefined) {
+      reject(new Error(message));
+    }
+  }
+
+  private clearPending(): void {
+    if (this.pendingTimer >= 0) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = -1;
+    }
+    this.pendingAction = '';
+    this.pendingClientRequestId = '';
+    this.pendingResolve = undefined;
+    this.pendingReject = undefined;
+  }
+}
+
 async function requestJson(
   settings: HostAgentSettings,
   path: string,
@@ -670,6 +1207,11 @@ function createHeaders(settings: HostAgentSettings, accept: string): CodeTaskHtt
 function cacheBustedPath(path: string): string {
   const separator = path.indexOf('?') >= 0 ? '&' : '?';
   return `${path}${separator}_=${Date.now()}`;
+}
+
+function createBridgeRequestId(prefix: string): string {
+  const random = Math.floor(Math.random() * 1000000);
+  return `${prefix}-${Date.now()}-${random}`;
 }
 
 function consumeSseBuffer(buffer: string, callbacks: CodeTaskEventStreamCallbacks): string {
